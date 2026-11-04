@@ -66,7 +66,12 @@ public:
             { "suggestionticket",   HandleGoTicketCommand<SuggestionTicket>,rbac::RBAC_PERM_COMMAND_GO,             Console::No },
             { "offset",             HandleGoOffsetCommand,                  rbac::RBAC_PERM_COMMAND_GO,             Console::No },
             { "instance",           HandleGoInstanceCommand,                rbac::RBAC_PERM_COMMAND_GO,             Console::No },
-            { "boss",               HandleGoBossCommand,                    rbac::RBAC_PERM_COMMAND_GO,             Console::No }
+            { "boss",               HandleGoBossCommand,                    rbac::RBAC_PERM_COMMAND_GO,             Console::No },
+            // Blank-name fallback: lets `.go <x> <y> [z] [mapid] [o]` work without the "xyz" token.
+            // ChatCommandNode::LoadCommandsIntoMap attaches empty-name entries to the PARENT node
+            // itself, and TryExecuteCommand invokes that node's invoker with the leftover text when
+            // no subcommand matches. Must stay the only empty name in this table (ASSERT guards it).
+            { "",                   HandleGoXYZCommand,                     rbac::RBAC_PERM_COMMAND_GO,             Console::No }
         };
 
         static ChatCommandTable commandTable =
