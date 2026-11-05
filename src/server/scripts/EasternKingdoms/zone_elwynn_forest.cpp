@@ -22,6 +22,8 @@
 #include "ConversationAI.h"
 #include "CreatureAIImpl.h"
 #include "CreatureGroups.h"
+#include "DB2Stores.h"
+#include "EventMap.h"
 #include "MotionMaster.h"
 #include "ObjectAccessor.h"
 #include "PhasingHandler.h"
@@ -712,6 +714,7 @@ class spell_stealth_vanessa_human_heritage : public AuraScript
 
 void AddSC_elwynn_forest()
 {
+
     // Creature
     RegisterCreatureAI(npc_cameron);
     RegisterCreatureAI(npc_master_mathias_shaw_human_heritage_lions_pride_inn_basement);
