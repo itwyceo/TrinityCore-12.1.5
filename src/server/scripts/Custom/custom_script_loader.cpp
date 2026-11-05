@@ -16,9 +16,11 @@
  */
 
 // This is where scripts' loading functions should be declared:
+void AddSC_northshire_brawl();          // Custom/Northshire/npc_blackrock_battle_worg.cpp
 
 // The name of this function should match:
 // void Add${NameOfDirectory}Scripts()
 void AddCustomScripts()
 {
+    AddSC_northshire_brawl();
 }
