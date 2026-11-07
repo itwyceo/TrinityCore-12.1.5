@@ -95,6 +95,7 @@
 #include "EventMap.h"
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
+#include "Log.h"
 #include "ObjectAccessor.h"
 #include "ScriptedCreature.h"
 #include "ScriptMgr.h"
@@ -301,6 +302,7 @@ public:
     {
         _events.Reset();
         _infantryGuid = ObjectGuid::Empty;
+        _loggedFailure = false;
         _events.ScheduleEvent(EVENT_SELECT_INFANTRY, Seconds(1));
     }
 
@@ -351,22 +353,54 @@ private:
         Creature* infantry = me->FindNearestCreature(NPC_STORMWIND_INFANTRY_ENTRY, BRAWL_START_RANGE, true);
         if (!infantry)
         {
+            if (!_loggedFailure)
+            {
+                _loggedFailure = true;
+                TC_LOG_INFO("scripts", "Northshire brawl: worg {} sees no infantry within {:.0f} yd (map {}, zone {}, area {})",
+                    me->GetGUID().ToString(), BRAWL_START_RANGE, me->GetMapId(), me->GetZoneId(), me->GetAreaId());
+            }
+
             _events.ScheduleEvent(EVENT_SELECT_INFANTRY, Seconds(3));
             return;
         }
 
         _infantryGuid = infantry->GetGUID();
-        bool const started = me->Attack(infantry, true);
+
+        bool started = me->Attack(infantry, true);
+
+        // Fallback for neutral factions: the core refuses Unit::Attack when neither side is
+        // hostile, but an explicit combat state plus a threat reference on both sides sticks.
+        if (!started)
+        {
+            me->SetInCombatWith(infantry);
+            infantry->SetInCombatWith(me);
+            me->GetThreatManager().AddThreat(infantry, 1000.0f);
+            infantry->GetThreatManager().AddThreat(me, 1000.0f);
+            started = me->GetVictim() != nullptr;
+        }
 
         if (started)
+        {
+            _loggedFailure = false;
+
             if (CreatureAI* infantryAI = infantry->AI())
                 infantryAI->AttackStart(me);
+        }
+        else if (!_loggedFailure)
+        {
+            _loggedFailure = true;
+            TC_LOG_INFO("scripts", "Northshire brawl: worg {} cannot engage infantry {} (dist {:.2f}, map {}/zone {}/area {}, hostile {}/{})",
+                me->GetGUID().ToString(), infantry->GetGUID().ToString(), me->GetDistance(infantry),
+                me->GetMapId(), me->GetZoneId(), me->GetAreaId(),
+                me->IsHostileTo(infantry), infantry->IsHostileTo(me));
+        }
 
         _events.ScheduleEvent(EVENT_SELECT_INFANTRY, Seconds(started ? 10 : 2));
     }
 
     EventMap _events;
     ObjectGuid _infantryGuid;
+    bool _loggedFailure = false;
 };
 
 void AddSC_northshire_brawl()
