@@ -19,6 +19,8 @@
 #include "Errors.h"
 #include "SFMTRand.h"
 #include <boost/math/tools/roots.hpp>
+#include <array>
+#include <atomic>
 #include <memory>
 #include <random>
 
@@ -93,14 +95,45 @@ uint32 urandweighted(size_t count, double const* chances)
 
 namespace
 {
-struct PseudoRandomDistributionChanceTable : std::array<float, 10000>
+// Values are computed on first use instead of eagerly at static initialization time.
+// The eager version took ~11 seconds before main() because newton_raphson_iterate is
+// seeded with chance * chance: for small chances the residual function then loops up to
+// 1 / (chance * chance) times, i.e. 100 million iterations for the very first entry.
+class PseudoRandomDistributionChanceTable
 {
+public:
+    static constexpr std::size_t TableSize = 10000;
+
     PseudoRandomDistributionChanceTable()
     {
-        (*this)[0] = 0.0f;
-        for (std::size_t i = 1; i < size(); ++i)
-            (*this)[i] = NormalizePseudoRandomDistributionChance(i * 0.0001f);
+        for (std::atomic<float>& value : _values)
+            value.store(EmptyValue, std::memory_order_relaxed);
     }
+
+    float Get(std::size_t index) const
+    {
+        // chance 0 is the identity case, Normalize() would divide by zero
+        if (index == 0)
+            return 0.0f;
+
+        std::atomic<float>& slot = _values[index];
+        float value = slot.load(std::memory_order_acquire);
+        if (value >= 0.0f)
+            return value;
+
+        value = NormalizePseudoRandomDistributionChance(float(index) * 0.0001f);
+
+        // the computation is deterministic, concurrent callers may compute the same
+        // entry in parallel but they all produce the same result
+        float expected = EmptyValue;
+        if (slot.compare_exchange_strong(expected, value, std::memory_order_release, std::memory_order_relaxed))
+            return value;
+
+        return slot.load(std::memory_order_relaxed);
+    }
+
+private:
+    static constexpr float EmptyValue = -1.0f;
 
     static float NormalizePseudoRandomDistributionChance(float chance)
     {
@@ -125,6 +158,8 @@ struct PseudoRandomDistributionChanceTable : std::array<float, 10000>
             return result;
         }, chance * chance, 0.0f, chance, 6, iterationLimit);
     }
+
+    mutable std::array<std::atomic<float>, TableSize> _values;
 } const ChanceCache;
 }
 
@@ -134,7 +169,8 @@ bool roll_chance(float chance, PseudoRandomDistributionState& state)
     if (chanceIndex < 0)
         return false;
 
-    if (chanceIndex >= std::ssize(ChanceCache) || state.AccumulateChance(ChanceCache[chanceIndex]) > rand_norm())
+    if (chanceIndex >= std::ptrdiff_t(PseudoRandomDistributionChanceTable::TableSize)
+        || state.AccumulateChance(ChanceCache.Get(std::size_t(chanceIndex))) > rand_norm())
     {
         state.Reset();
         return true;

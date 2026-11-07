@@ -2677,6 +2677,12 @@ bool Creature::_IsTargetAcceptable(Unit const* target) const
     if (IsEngagedBy(target) || IsHostileTo(target))
         return true;
 
+    // Custom: Northshire brawl. Mirrors the exception in WorldObject::_IsValidAttackTarget so
+    // the worg and the infantry can enter combat while both stay neutral (yellow) to players.
+    if (((GetEntry() == 49871 && target->GetEntry() == 49869) || (GetEntry() == 49869 && target->GetEntry() == 49871))
+        && GetMapId() == 0)
+        return true;
+
     // if the target's victim is not friendly, or the target is friendly, the target is not acceptable
     return false;
 }

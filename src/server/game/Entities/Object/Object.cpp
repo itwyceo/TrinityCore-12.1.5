@@ -2407,6 +2407,21 @@ bool WorldObject::IsValidAttackTarget(WorldObject const* target, SpellInfo const
         }
     }
 
+    // Custom: Northshire brawl. The Blackrock Worg (49871) and the Stormwind Infantry (49869)
+    // are both neutral towards each other, so the CvC check right below would veto the
+    // script driven duel in npc_blackrock_battle_worg.cpp. Allow only this single pair to
+    // fight. The entry pair alone is unambiguous (both NPCs exist only in Northshire), so
+    // no zone check is done here on purpose: area data for 12.x can leave GetZoneId() at 0.
+    if (unit && unitTarget)
+    {
+        uint32 const entryA = unit->GetEntry();
+        uint32 const entryB = unitTarget->GetEntry();
+
+        if (((entryA == 49871 && entryB == 49869) || (entryA == 49869 && entryB == 49871))
+            && unit->GetMapId() == 0)
+            return true;
+    }
+
     // CvC case - can attack each other only when one of them is hostile
     if (unit && !unit->HasUnitFlag(UNIT_FLAG_PLAYER_CONTROLLED) && unitTarget && !unitTarget->HasUnitFlag(UNIT_FLAG_PLAYER_CONTROLLED))
         return IsHostileTo(unitTarget) || unitTarget->IsHostileTo(this);
