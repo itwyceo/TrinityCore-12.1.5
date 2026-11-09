@@ -456,7 +456,8 @@ bool WorldSession::Update(uint32 diff, PacketFilter& updater)
                         , GetPlayerInfo());
                     break;
                 case STATUS_UNHANDLED:
-                    TC_LOG_ERROR("network.opcode", "Received not handled opcode {} from {}", GetOpcodeNameForLogging(static_cast<OpcodeClient>(packet->GetOpcode()))
+                    // 未实现的 CMSG 属于客户端正常行为，降为 DEBUG 级，避免刷屏；STATUS_NEVER 仍保留 ERROR 告警
+                    TC_LOG_DEBUG("network.opcode", "Received not handled opcode {} from {}", GetOpcodeNameForLogging(static_cast<OpcodeClient>(packet->GetOpcode()))
                         , GetPlayerInfo());
                     break;
                 case STATUS_IGNORED:
