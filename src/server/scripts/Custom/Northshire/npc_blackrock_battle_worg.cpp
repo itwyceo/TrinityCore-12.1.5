@@ -162,7 +162,29 @@ namespace
 // ---------------------------------------------------------------------------
 struct npc_brother_paxton : public ScriptedAI
 {
-    explicit npc_brother_paxton(Creature* creature) : ScriptedAI(creature) { }
+    explicit npc_brother_paxton(Creature* creature) : ScriptedAI(creature)
+    {
+        // Paxton keeps patching the infantry up mid-brawl, which drags him into
+        // combat -- and Player::GetQuestDialogStatus() returns QuestGiverStatus::None
+        // for any quest giver that is in combat unless
+        // UNIT_FLAG3_ALLOW_INTERACTION_WHILE_IN_COMBAT is set. Without that flag the
+        // turn-in icon vanishes every time he starts healing.
+        //
+        // The authoritative source of this flag is the DATABASE, not code:
+        // creature_template_difficulty.StaticFlags3 bit 0x00040000
+        // (CREATURE_STATIC_FLAG_3_ALLOW_INTERACTION_WHILE_IN_COMBAT). It is mapped onto
+        // unit_flags3 by ObjectMgr::ChooseCreatureFlags, so it is re-applied both when the
+        // creature is created and on every respawn (Creature::setDeathState).
+        //
+        // Do NOT try creature_template.unit_flags3: that bit is listed in
+        // UNIT_FLAG3_DISALLOWED (UnitDefines.h) and ObjectMgr::CheckCreatureTemplate
+        // strips it on load with a "removing incorrect flag" error.
+        //
+        // The line below is only a safety net for the very first spawn; it survives in
+        // memory but is wiped by the ReplaceAllUnitFlags3() done on respawn, which is
+        // exactly why the DB flag above is the one that matters.
+        me->SetUnitFlag3(UNIT_FLAG3_ALLOW_INTERACTION_WHILE_IN_COMBAT);
+    }
 
     void Reset() override
     {
