@@ -126,6 +126,7 @@
 #include "SpellPackets.h"
 #include "StringConvert.h"
 #include "TalentPackets.h"
+#include "TaxiPackets.h"
 #include "TerrainMgr.h"
 #include "ToyPackets.h"
 #include "TradeData.h"
@@ -6320,6 +6321,60 @@ bool Player::HasExploredZone(uint32 areaId) const
 
     uint64 mask = uint64(1) << (area->AreaBit % PLAYER_EXPLORED_ZONES_BITS);
     return (m_activePlayerData->BitVectors->Values[PLAYER_DATA_FLAG_EXPLORED_ZONES_INDEX].Values[playerIndexOffset] & mask) != 0;
+}
+
+void Player::DebugSetTaxiBitVector(uint32 vectorIndex, uint32 bitCount)
+{
+    if (vectorIndex >= UF::size<decltype(UF::BitVectors::Values)>())
+        return;
+
+    uint32 const blockCount = (bitCount + PLAYER_DATA_FLAG_VALUE_BITS - 1) / PLAYER_DATA_FLAG_VALUE_BITS;
+    for (uint32 block = 0; block < blockCount; ++block)
+        SetUpdateFieldValue(m_values
+            .ModifyValue(&Player::m_activePlayerData)
+            .ModifyValue(&UF::ActivePlayerData::BitVectors)
+            .ModifyValue(&UF::BitVectors::Values, vectorIndex)
+            .ModifyValue(&UF::BitVector::Values, block), std::numeric_limits<uint64>::max());
+}
+
+void Player::SyncTaxiNodes()
+{
+    // The client decides whether a flight point is discovered from the player's BitVectors update
+    // field, indexed by TaxiNodes.db2 CharacterBitNumber (not by the node id). Flight points are
+    // account wide since The War Within, and the world map / flight master icon read the account
+    // bit vector, so the mask is mirrored into both vectors.
+    std::vector<uint64> blocks;
+    for (TaxiNodesEntry const* node : sTaxiNodesStore)
+    {
+        if (!m_taxi.IsTaximaskNodeKnown(node->ID))
+            continue;
+
+        // CharacterBitNumber is 1-based, the client stores it as a 0-based bit index
+        if (!node->CharacterBitNumber)
+            continue;
+
+        uint32 const bitNumber = uint32(node->CharacterBitNumber) - 1;
+        std::size_t block = bitNumber / PLAYER_DATA_FLAG_VALUE_BITS;
+        if (block >= blocks.size())
+            blocks.resize(block + 1, 0);
+
+        blocks[block] |= UI64LIT(1) << (bitNumber % PLAYER_DATA_FLAG_VALUE_BITS);
+    }
+
+    for (std::size_t block = 0; block < blocks.size(); ++block)
+    {
+        SetUpdateFieldValue(m_values
+            .ModifyValue(&Player::m_activePlayerData)
+            .ModifyValue(&UF::ActivePlayerData::BitVectors)
+            .ModifyValue(&UF::BitVectors::Values, PLAYER_DATA_FLAG_CHARACTER_TAXI_NODES_INDEX)
+            .ModifyValue(&UF::BitVector::Values, uint32(block)), blocks[block]);
+
+        SetUpdateFieldValue(m_values
+            .ModifyValue(&Player::m_activePlayerData)
+            .ModifyValue(&UF::ActivePlayerData::BitVectors)
+            .ModifyValue(&UF::BitVectors::Values, PLAYER_DATA_FLAG_ACCOUNT_TAXI_NODES_INDEX)
+            .ModifyValue(&UF::BitVector::Values, uint32(block)), blocks[block]);
+    }
 }
 
 void Player::UpdateZoneAndAreaId()
@@ -13909,8 +13964,17 @@ void Player::PrepareGossipMenu(WorldObject* source, uint32 menuId, bool showQues
             switch (gossipMenuItem.OptionNpc)
             {
                 case GossipOptionNpc::Taxinode:
+                    // Refresh the per-unit taxi status so the flight master's overhead icon
+                    // stops being shown as "undiscovered" once the node is known.
+                    GetSession()->SendTaxiStatus(creature->GetGUID());
                     if (GetSession()->SendLearnNewTaxiNode(creature))
+                    {
+                        // The learn packets already fire the "new flight path" toast; open the
+                        // flight map right away so a single click on an unknown flight master
+                        // is enough instead of aborting the gossip menu.
+                        GetSession()->SendTaxiMenu(creature);
                         return;
+                    }
                     break;
                 case GossipOptionNpc::SpiritHealer:
                     if (!isDead())
@@ -25066,6 +25130,11 @@ void Player::SendInitialPacketsAfterAddToMap()
     uint32 newzone, newarea;
     GetZoneAndAreaId(newzone, newarea);
     UpdateZone(newzone, newarea);                            // also call SendInitWorldStates();
+
+    // broadcast the known flight points again after the player is fully in world - the client
+    // builds its map flight point cache during login, so the values written while loading the
+    // character can be lost before they are used
+    SyncTaxiNodes();
 
     GetSession()->SendLoadCUFProfiles();
 

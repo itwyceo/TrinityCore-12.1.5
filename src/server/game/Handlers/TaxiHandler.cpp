@@ -35,7 +35,10 @@
 void WorldSession::HandleEnableTaxiNodeOpcode(WorldPackets::Taxi::EnableTaxiNode& enableTaxiNode)
 {
     if (Creature* unit = GetPlayer()->GetNPCIfCanInteractWith(enableTaxiNode.Unit, UNIT_NPC_FLAG_FLIGHTMASTER, UNIT_NPC_FLAG_2_NONE))
+    {
         SendLearnNewTaxiNode(unit);
+        SendTaxiMenu(unit);
+    }
 }
 
 void WorldSession::HandleTaxiNodeStatusQueryOpcode(WorldPackets::Taxi::TaxiNodeStatusQuery& taxiNodeStatusQuery)
@@ -66,6 +69,8 @@ void WorldSession::SendTaxiStatus(ObjectGuid guid)
     else
         data.Status = TAXISTATUS_NOT_ELIGIBLE;
 
+    TC_LOG_DEBUG("network", "SendTaxiStatus: unit {} ({}) at map {} {} {} nearest {} known {} status {}", guid.ToString(), unit->GetEntry(), unit->GetMapId(), unit->GetPositionX(), unit->GetPositionY(), nearest,
+        nearest ? GetPlayer()->m_taxi.IsTaximaskNodeKnown(nearest) : false, uint32(data.Status));
     SendPacket(data.Write());
 }
 
@@ -82,11 +87,11 @@ void WorldSession::HandleTaxiQueryAvailableNodesOpcode(WorldPackets::Taxi::TaxiQ
     if (GetPlayer()->HasUnitState(UNIT_STATE_DIED))
         GetPlayer()->RemoveAurasByType(SPELL_AURA_FEIGN_DEATH);
 
-    // unknown taxi node case
-    if (SendLearnNewTaxiNode(unit))
-        return;
-
-    // known taxi node case
+    // Learn the node first (SMSG_NEW_TAXI_PATH + SMSG_TAXI_NODE_STATUS with TAXISTATUS_LEARNED,
+    // which is what makes the client show the "new flight path" toast and refresh the world map
+    // flight points at the moment the flight master is clicked) and always send the flight map
+    // afterwards so the window opens even if the client does not re-query the nodes itself.
+    SendLearnNewTaxiNode(unit);
     SendTaxiMenu(unit);
 }
 
@@ -115,11 +120,13 @@ void WorldSession::SendTaxiMenu(Creature* unit)
     TaxiMask reachableNodes;
     TaxiPathGraph::GetReachableNodesMask(sTaxiNodesStore.LookupEntry(curloc), &reachableNodes);
 
+    // CanLandNodes is documented as "Nodes known by player" and the client uses exactly this
+    // mask to decide which flight points are discovered (MapTaxiNodeInfo.isUndiscovered), so it
+    // has to keep the full known set. Only CanUseNodes ("nodes available for use") may be limited
+    // to what is reachable from the current flight master. Filtering both made the client mark
+    // every flight point outside this node's component as undiscovered on the world map.
     for (std::size_t i = 0; i < reachableNodes.size(); ++i)
-    {
-        data.CanLandNodes[i] &= reachableNodes[i];
         data.CanUseNodes[i] &= reachableNodes[i];
-    }
 
     SendPacket(data.Write());
 
@@ -136,8 +143,15 @@ bool WorldSession::SendLearnNewTaxiNode(Creature* unit)
 
     if (GetPlayer()->m_taxi.SetTaximaskNode(curloc))
     {
+        // Send the "new path" packet before the update field sync: once the client sees the
+        // node as known it stops treating SMSG_NEW_TAXI_PATH as a new discovery.
         SendPacket(WorldPackets::Taxi::NewTaxiPath(curloc).Write());
 
+        GetPlayer()->SyncTaxiNodes();
+
+        // The status has to follow the new path immediately: it is what makes the client
+        // show the "new flight path learned" toast and refresh the flight points on the
+        // world map (TAXI_NODE_STATUS_CHANGED) right when the flight master is clicked.
         WorldPackets::Taxi::TaxiNodeStatus data;
         data.Unit = unit->GetGUID();
         data.Status = TAXISTATUS_LEARNED;
@@ -153,7 +167,10 @@ bool WorldSession::SendLearnNewTaxiNode(Creature* unit)
 void WorldSession::SendDiscoverNewTaxiNode(uint32 nodeid)
 {
     if (GetPlayer()->m_taxi.SetTaximaskNode(nodeid))
+    {
+        GetPlayer()->SyncTaxiNodes();
         SendPacket(WorldPackets::Taxi::NewTaxiPath(nodeid).Write());
+    }
 }
 
 void WorldSession::HandleActivateTaxiOpcode(WorldPackets::Taxi::ActivateTaxi& activateTaxi)
