@@ -52,6 +52,7 @@ EndScriptData */
 #include "RBAC.h"
 #include "SpellMgr.h"
 #include "SpellPackets.h"
+#include "TaxiPackets.h"
 #include "Transport.h"
 #include "World.h"
 #include "WorldSession.h"
@@ -132,7 +133,11 @@ public:
             { "guidlimits",         HandleDebugGuidLimitsCommand,          rbac::RBAC_PERM_COMMAND_DEBUG,   Console::Yes },
             { "objectcount",        HandleDebugObjectCountCommand,         rbac::RBAC_PERM_COMMAND_DEBUG,   Console::Yes },
             { "questreset",         HandleDebugQuestResetCommand,          rbac::RBAC_PERM_COMMAND_DEBUG,   Console::Yes },
-            { "personalclone",      HandleDebugBecomePersonalClone,        rbac::RBAC_PERM_COMMAND_DEBUG,   Console::No }
+            { "personalclone",      HandleDebugBecomePersonalClone,        rbac::RBAC_PERM_COMMAND_DEBUG,   Console::No },
+            { "taxisync",           HandleDebugTaxiSyncCommand,            rbac::RBAC_PERM_COMMAND_DEBUG,   Console::No },
+            { "taximask",           HandleDebugTaxiMaskCommand,            rbac::RBAC_PERM_COMMAND_DEBUG,   Console::No },
+            { "taxistatus",         HandleDebugTaxiStatusCommand,          rbac::RBAC_PERM_COMMAND_DEBUG,   Console::No },
+            { "taxipath",           HandleDebugTaxiPathCommand,            rbac::RBAC_PERM_COMMAND_DEBUG,   Console::No }
         };
         static ChatCommandTable commandTable =
         {
@@ -153,6 +158,83 @@ public:
         else
             return false;
 
+        return true;
+    }
+
+    // 用法：.debug taxisync
+    // 按当前已学飞行点重新同步 ActivePlayerData::BitVectors，用于验证位号映射是否正确
+    static bool HandleDebugTaxiSyncCommand(ChatHandler* handler)
+    {
+        Player* player = handler->GetPlayer();
+        if (!player)
+            return false;
+
+        player->SyncTaxiNodes();
+        handler->PSendSysMessage("已按当前飞行点掩码重新同步位向量");
+        return true;
+    }
+
+    // 用法：.debug taximask <位向量索引> <位数>
+    // 把玩家 ActivePlayerData::BitVectors 指定索引的前 N 位全部置 1，用于诊断客户端读取的是哪个位向量
+    static bool HandleDebugTaxiMaskCommand(ChatHandler* handler, uint32 vectorIndex, uint32 bitCount)
+    {
+        Player* player = handler->GetPlayer();
+        if (!player)
+            return false;
+
+        player->DebugSetTaxiBitVector(vectorIndex, bitCount);
+        handler->PSendSysMessage("BitVectors[{}] 前 {} 位已全部置 1", vectorIndex, bitCount);
+        return true;
+    }
+
+    // 用法：.debug taxistatus <0-3>
+    // 对选中的飞行管理员发送指定状态的 SMSG_TAXI_NODE_STATUS，用于确定客户端状态枚举的取值
+    static bool HandleDebugTaxiStatusCommand(ChatHandler* handler, uint8 status)
+    {
+        Player* player = handler->GetPlayer();
+        if (!player)
+            return false;
+
+        Creature* creature = handler->getSelectedCreature();
+        if (!creature)
+        {
+            handler->SendSysMessage("请先选中一个飞行管理员");
+            return true;
+        }
+
+        if (status > TAXISTATUS_NOT_ELIGIBLE)
+        {
+            handler->SendSysMessage("状态取值范围 0-3");
+            return true;
+        }
+
+        uint32 nodeId = sObjectMgr->GetNearestTaxiNode(creature->GetPositionX(), creature->GetPositionY(), creature->GetPositionZ(), creature->GetMapId(), player->GetTeam());
+
+        WorldPackets::Taxi::TaxiNodeStatus data;
+        data.Unit = creature->GetGUID();
+        data.Status = status;
+        player->SendDirectMessage(data.Write());
+
+        handler->PSendSysMessage("已发送 TAXI_NODE_STATUS: node {} status {} unit {}", nodeId, status, creature->GetGUID().ToString());
+        return true;
+    }
+
+    // 用法：.debug taxipath <节点ID>
+    // 单独发送 SMSG_NEW_TAXI_PATH，用于验证客户端是否仍会弹出“学会新飞行点”提示
+    static bool HandleDebugTaxiPathCommand(ChatHandler* handler, uint32 nodeId)
+    {
+        Player* player = handler->GetPlayer();
+        if (!player)
+            return false;
+
+        if (!sTaxiNodesStore.LookupEntry(nodeId))
+        {
+            handler->SendSysMessage("飞行点不存在");
+            return true;
+        }
+
+        player->SendDirectMessage(WorldPackets::Taxi::NewTaxiPath(int32(nodeId)).Write());
+        handler->PSendSysMessage("已发送 NEW_TAXI_PATH: node {}", nodeId);
         return true;
     }
 
