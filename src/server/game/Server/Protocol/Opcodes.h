@@ -722,6 +722,9 @@ enum OpcodeClient : uint32
     CMSG_NEIGHBORHOOD_REMOVE_SECONDARY_OWNER                        = 0x3B0003,
     CMSG_NEIGHBORHOOD_SET_PUBLIC_FLAG                               = 0x3B0001,
     CMSG_NEIGHBORHOOD_UPDATE_NAME                                   = 0x3B0000,
+    // Not a Blizzard opcode: private telemetry channel added by the NetEase (CN) client build.
+    // Payload is plain JSON ("launch sdk" / "initsdk_succ" / periodic "heartbeat"), purely informational.
+    CMSG_NETEASE_SDK_TELEMETRY                                      = 0x430195,
     CMSG_NEUTRAL_PLAYER_SELECT_FACTION                              = 0x3D0086,
     CMSG_NEXT_CINEMATIC_CAMERA                                      = 0x3E00E6,
     CMSG_NPC_CRAFTING_ORDER_REQUEST                                 = 0x3E0131,

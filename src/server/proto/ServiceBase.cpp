@@ -40,7 +40,9 @@ void ServiceBase::LogCallServerMethod(char const* methodName, char const* inputT
 
 void ServiceBase::LogUnimplementedServerMethod(char const* methodName, google::protobuf::Message const* request)
 {
-    TC_LOG_ERROR("service.protobuf", "{} Client tried to call not implemented method {}({{ {} }})",
+    // 12.x clients routinely poll services this core does not implement (e.g. PresenceService.Update
+    // every few seconds). Logging that at error level floods the console, so keep it at debug.
+    TC_LOG_DEBUG("service.protobuf", "{} Client tried to call not implemented method {}({{ {} }})",
             GetCallerInfo(), methodName, request->ShortDebugString());
 }
 
