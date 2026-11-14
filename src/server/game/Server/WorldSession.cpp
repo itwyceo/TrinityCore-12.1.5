@@ -261,7 +261,14 @@ void WorldSession::SendPacket(WorldPacket const* packet, bool forced /*= false*/
     {
         if (handler->Status == STATUS_UNHANDLED)
         {
-            TC_LOG_ERROR("network.opcode", "Prevented sending disabled opcode {} to {}", GetOpcodeNameForLogging(static_cast<OpcodeServer>(packet->GetOpcode())), GetPlayerInfo());
+            // 12.x: several server opcodes are registered as STATUS_UNHANDLED upstream because their
+            // structure is not confirmed yet. A few of them are fired on every login by design
+            // (see SMSG_TALENTS_INVOLUNTARILY_RESET from Player::InitTalentForLevel for level < 15),
+            // so keep the packet blocked but demote this expected case to DEBUG to avoid log spam.
+            if (packet->GetOpcode() == SMSG_TALENTS_INVOLUNTARILY_RESET)
+                TC_LOG_DEBUG("network.opcode", "Prevented sending disabled opcode {} to {}", GetOpcodeNameForLogging(static_cast<OpcodeServer>(packet->GetOpcode())), GetPlayerInfo());
+            else
+                TC_LOG_ERROR("network.opcode", "Prevented sending disabled opcode {} to {}", GetOpcodeNameForLogging(static_cast<OpcodeServer>(packet->GetOpcode())), GetPlayerInfo());
             return;
         }
     }
