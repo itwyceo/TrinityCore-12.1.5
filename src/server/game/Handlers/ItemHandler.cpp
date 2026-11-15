@@ -16,6 +16,7 @@
  */
 
 #include "WorldSession.h"
+#include "Bag.h"
 #include "BattlePetMgr.h"
 #include "Common.h"
 #include "Creature.h"
@@ -29,6 +30,7 @@
 #include "ObjectMgr.h"
 #include "Player.h"
 #include "World.h"
+#include <algorithm>
 
 void WorldSession::HandleSplitItemOpcode(WorldPackets::Item::SplitItem& splitItem)
 {
@@ -1203,24 +1205,126 @@ void WorldSession::HandleUseCritterItem(WorldPackets::Item::UseCritterItem& useC
     _player->DestroyItem(item->GetBagSlot(), item->GetSlot(), true);
 }
 
+namespace
+{
+    // 12.x 的容器模型：主背包是 INVENTORY_SLOT_BAG_0 下的 35.. 号槽，背上的包是
+    // 30..33、银行包是 63..68，包内格子按 (包槽, 包内格) 二级定位。
+    struct CleanupSlot
+    {
+        uint8 Bag;
+        uint8 Slot;
+        Item* ItemPtr;
+    };
+
+    // 专业背包（采药包、矿石包…）只收特定物品。把它们和普通格子放进一个池子里
+    // 重排，会有物品被塞进装不下的包。所以只有 BagFamily 为 0 的普通背包参与
+    // 混排，专业背包原样不动。
+    bool IsSharedBag(Bag const* bag)
+    {
+        ItemTemplate const* proto = bag->GetTemplate();
+        if (!proto)
+            return false;
+
+        return proto->GetBagFamily() == 0;
+    }
+
+    // 收集参与整理的槽位。空格也要收进来：不知道空格在哪，就算不出目标布局。
+    void CollectCleanupSlots(Player* player, bool bank, std::vector<CleanupSlot>& pool)
+    {
+        if (!bank)
+        {
+            uint8 backpackEnd = uint8(INVENTORY_SLOT_ITEM_START + player->GetInventorySlotCount());
+            for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < backpackEnd; ++slot)
+                pool.push_back({ INVENTORY_SLOT_BAG_0, slot, player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot) });
+
+            for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+            {
+                Bag* bag = player->GetBagByPos(bagSlot);
+                if (!bag || !IsSharedBag(bag))
+                    continue;
+
+                for (uint8 slot = 0; slot < bag->GetBagSize(); ++slot)
+                    pool.push_back({ bagSlot, slot, GetItemInBag(bag, slot) });
+            }
+        }
+        else
+        {
+            for (uint8 bagSlot = BANK_SLOT_BAG_START; bagSlot < BANK_SLOT_BAG_END; ++bagSlot)
+            {
+                Bag* bag = player->GetBagByPos(bagSlot);
+                if (!bag || !IsSharedBag(bag))
+                    continue;
+
+                for (uint8 slot = 0; slot < bag->GetBagSize(); ++slot)
+                    pool.push_back({ bagSlot, slot, GetItemInBag(bag, slot) });
+            }
+        }
+    }
+
+    // 整理本体：把物品全部摘下来，按 itemID 升序填回最前面的连续槽位，空格挤到最后。
+    // 必须先摘干净再放 —— 往还有物品的槽位里放会走 _StoreItem 的堆叠合并分支，
+    // 两个不同位置的堆叠被并成一个，物品数量就对不上了。
+    // 这里不做堆叠合并：合并要销毁被吸干的 Item 并同步删库，写错就是丢物品。
+    // 排序压紧这一步先保证绝对不丢东西，合并可以以后单独加。
+    void CleanupPool(Player* player, std::vector<CleanupSlot> const& pool)
+    {
+        std::vector<Item*> items;
+        items.reserve(pool.size());
+        for (CleanupSlot const& slot : pool)
+            if (slot.ItemPtr)
+                items.push_back(slot.ItemPtr);
+
+        if (items.size() < 2)
+            return;
+
+        std::stable_sort(items.begin(), items.end(), [](Item* left, Item* right)
+        {
+            return left->GetEntry() < right->GetEntry();
+        });
+
+        for (CleanupSlot const& slot : pool)
+            if (slot.ItemPtr)
+                player->RemoveItem(slot.Bag, slot.Slot, true);
+
+        for (size_t index = 0; index < items.size(); ++index)
+        {
+            uint16 pos = uint16((uint16(pool[index].Bag) << 8) | pool[index].Slot);
+            ItemPosCountVec dest;
+            dest.emplace_back(pos, items[index]->GetCount());
+
+            if (!player->StoreItem(dest, items[index], true))
+            {
+                // 池子清空后可用格子数和原来一样，正常走不到这里。真走到了说明
+                // 目标格被别处占了，记日志比静默丢物品强。
+                TC_LOG_ERROR("network", "HandleSortBags: item {} of {} could not be placed back at pos {}",
+                    items[index]->GetEntry(), player->GetName(), pos);
+            }
+        }
+    }
+}
+
 void WorldSession::HandleSortAccountBankBags(WorldPackets::Item::SortAccountBankBags& /*sortAccountBankBags*/)
 {
-    // TODO: Implement sorting
-    // Placeholder to prevent completely locking out bags clientside
+    // 账号银行在 TrinityCore 里整体还是 NYI（ItemSearchLocation::AccountBank），
+    // 这里照旧只回完成包，避免客户端一直卡在整理动画里。
     SendPacket(WorldPackets::Item::BagCleanupFinished().Write());
 }
 
 void WorldSession::HandleSortBags(WorldPackets::Item::SortBags& /*sortBags*/)
 {
-    // TODO: Implement sorting
-    // Placeholder to prevent completely locking out bags clientside
+    std::vector<CleanupSlot> pool;
+    CollectCleanupSlots(_player, false, pool);
+    CleanupPool(_player, pool);
+
     SendPacket(WorldPackets::Item::BagCleanupFinished().Write());
 }
 
 void WorldSession::HandleSortBankBags(WorldPackets::Item::SortBankBags& /*sortBankBags*/)
 {
-    // TODO: Implement sorting
-    // Placeholder to prevent completely locking out bags clientside
+    std::vector<CleanupSlot> pool;
+    CollectCleanupSlots(_player, true, pool);
+    CleanupPool(_player, pool);
+
     SendPacket(WorldPackets::Item::BagCleanupFinished().Write());
 }
 
