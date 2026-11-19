@@ -40,6 +40,8 @@ namespace Creatures
     static constexpr uint32 HomelessStormwindCitizen2 = 42384;
     static constexpr uint32 WestPlainDrifter = 42391;
     static constexpr uint32 Transient = 42383;
+    static constexpr uint32 WestPlainsDrifterFollower = 42400;
+    static constexpr uint32 WestfallStew = 42617;
     static constexpr uint32 LousPartingThoughtsTrigger = 42562;
     static constexpr uint32 Thug = 42387;
     static constexpr uint32 SmallTimeHustler = 42390;
@@ -66,6 +68,8 @@ namespace Spells
     static constexpr uint32 SummonRagamuffinLooter4 = 79173;
     static constexpr uint32 HoboAggro = 79168;
     static constexpr uint32 HoboInformation = 79184;
+    static constexpr uint32 FullBelly = 79451;
+    static constexpr uint32 CosmeticSleep = 78677;
 }
 
 namespace Gossip
@@ -116,6 +120,16 @@ namespace Events
         static constexpr uint32 HustlerSay1 = 15;
         static constexpr uint32 HustlerEventReset = 16;
     }
+
+    namespace WestfallStew
+    {
+        // 11+ to stay clear of the MurderWasTheCaseThatTheyGaveMe event ids in the same switch
+        static constexpr uint32 Start = 11;
+        static constexpr uint32 MoveToStew = 12;
+        static constexpr uint32 ReturnHome = 13;
+        static constexpr uint32 Abort = 14;    // safety net: unlocks a citizen that never reached the stew
+        static constexpr uint32 GroupStew = 2; // must not collide with MurderWasTheCaseThatTheyGaveMe::GroupOOC
+    }
 }
 
 namespace Actions
@@ -134,6 +148,7 @@ namespace Actions
 namespace Data
 {
     static constexpr uint32 DataThugDeath = 1;
+    static constexpr uint32 DataWestfallStew = 1;
 }
 
 namespace Text
@@ -171,6 +186,15 @@ namespace Text
     {
         static constexpr uint32 HustlerSay0 = 0;
         static constexpr uint32 HustlerSay1 = 1;
+    }
+    // fed-by-stew lines, group ids differ per creature in creature_text
+    namespace StewText
+    {
+        static constexpr uint32 Citizen1 = 11;          // 42386
+        static constexpr uint32 Citizen2 = 12;          // 42384
+        static constexpr uint32 Transient = 17;         // 42383
+        static constexpr uint32 WestPlainsDrifter = 11; // 42391
+        static constexpr uint32 DrifterFollower = 6;    // 42400
     }
 }
 
@@ -525,6 +549,8 @@ struct npc_westfall_hobo_witness : public ScriptedAI
         _bribeFailed = false;
         _hoboRage = false;
         _flee = false;
+        _stewGUID.Clear();
+        _stewOldStandState = -1;
         me->SetNpcFlag(UNIT_NPC_FLAG_GOSSIP);
         me->SetImmuneToPC(true);
         _events.ScheduleEvent(Events::MurderWasTheCaseThatTheyGaveMe::ResumeMove, 100ms, Events::MurderWasTheCaseThatTheyGaveMe::GroupOOC);
@@ -552,9 +578,81 @@ struct npc_westfall_hobo_witness : public ScriptedAI
         }
     }
 
-    void SetGUID(ObjectGuid const& guid, int32 /*id*/) override
+    void SetGUID(ObjectGuid const& guid, int32 id) override
     {
+        // 26271 - Feeding the Hungry and the Hopeless: the stew hands us its own guid
+        if (id == int32(Data::DataWestfallStew))
+        {
+            if (!_stewGUID.IsEmpty())
+                return;
+
+            _stewGUID = guid;
+            _events.ScheduleEvent(Events::WestfallStew::Start, 0ms, Events::WestfallStew::GroupStew);
+            // safety net: combat, a stuck path or a despawned stew would otherwise keep the citizen locked forever
+            _events.ScheduleEvent(Events::WestfallStew::Abort, 20s, Events::WestfallStew::GroupStew);
+            return;
+        }
+
         _targetGUID = guid;
+    }
+
+    void MovementInform(uint32 type, uint32 id) override
+    {
+        if (type != POINT_MOTION_TYPE || id != 1)
+            return;
+
+        me->CastSpell(me, Spells::FullBelly, true);
+
+        if (Creature* stew = ObjectAccessor::GetCreature(*me, _stewGUID))
+        {
+            if (stew->IsSummon())
+                if (WorldObject* summoner = stew->ToTempSummon()->GetSummoner())
+                    if (Player* player = summoner->ToPlayer())
+                        player->KilledMonsterCredit(Creatures::WestfallStew);
+
+            if (roll_chance(50))
+            {
+                switch (me->GetEntry())
+                {
+                    case Creatures::HomelessStormwindCitizen1:
+                        Talk(Text::StewText::Citizen1, stew);
+                        break;
+                    case Creatures::HomelessStormwindCitizen2:
+                        Talk(Text::StewText::Citizen2, stew);
+                        break;
+                    case Creatures::Transient:
+                        Talk(Text::StewText::Transient, stew);
+                        break;
+                    case Creatures::WestPlainDrifter:
+                        Talk(Text::StewText::WestPlainsDrifter, stew);
+                        break;
+                    case Creatures::WestPlainsDrifterFollower:
+                        Talk(Text::StewText::DrifterFollower, stew);
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+
+        // Release the lock as soon as the meal is over, otherwise the citizen stays bound to a stew that
+        // no longer exists and ignores every following stew (Full Belly fades, but it never eats again).
+        _stewGUID.Clear();
+        _events.CancelEvent(Events::WestfallStew::Abort);
+        _events.ScheduleEvent(Events::WestfallStew::ReturnHome, 5s + 500ms, Events::WestfallStew::GroupStew);
+    }
+
+    void JustReachedHome() override
+    {
+        // back at the spawn point: restore the pose the citizen had before the stew showed up
+        if (_stewOldStandState < 0)
+            return;
+
+        if (_stewOldStandState == int32(UNIT_STAND_STATE_SLEEP) && !me->HasAura(Spells::CosmeticSleep))
+            me->CastSpell(me, Spells::CosmeticSleep, true);
+
+        me->SetStandState(UnitStandStateType(_stewOldStandState));
+        _stewOldStandState = -1;
     }
 
     void UpdateAI(uint32 diff) override
@@ -621,6 +719,46 @@ struct npc_westfall_hobo_witness : public ScriptedAI
                     else
                         _events.Repeat(30s, 80s);
                     break;
+                case Events::WestfallStew::Start:
+                    // remember the original pose: the Sentinel Hill hobos sleep on the ground and have to go
+                    // back to it once the meal is over, otherwise they stand up for the rest of their life
+                    if (_stewOldStandState < 0)
+                        _stewOldStandState = int32(me->GetStandState());
+
+                    me->SetStandState(UNIT_STAND_STATE_STAND);
+
+                    if (me->HasAura(Spells::CosmeticSleep))
+                        me->RemoveAurasDueToSpell(Spells::CosmeticSleep);
+
+                    _events.ScheduleEvent(Events::WestfallStew::MoveToStew, 2s, Events::WestfallStew::GroupStew);
+                    break;
+                case Events::WestfallStew::MoveToStew:
+                {
+                    if (Creature* stew = ObjectAccessor::GetCreature(*me, _stewGUID))
+                    {
+                        float x, y, z;
+                        stew->GetContactPoint(me, x, y, z, 0.2f);
+                        me->GetMotionMaster()->MovePoint(1, x, y, z);
+                    }
+                    else
+                    {
+                        // the stew despawned on the way: unlock so the next one can feed us
+                        _stewGUID.Clear();
+                        _events.CancelEvent(Events::WestfallStew::Abort);
+                        me->GetMotionMaster()->MoveTargetedHome();
+                    }
+                    break;
+                }
+                case Events::WestfallStew::ReturnHome:
+                    _stewGUID.Clear();
+                    me->GetMotionMaster()->MoveTargetedHome();
+                    break;
+                case Events::WestfallStew::Abort:
+                    // never made it to the stew (combat, stuck path, despawn): unlock and head back
+                    _stewGUID.Clear();
+                    if (!me->IsInCombat())
+                        me->GetMotionMaster()->MoveTargetedHome();
+                    break;
                 default:
                     break;
             }
@@ -634,9 +772,181 @@ struct npc_westfall_hobo_witness : public ScriptedAI
 private:
     EventMap _events;
     ObjectGuid _targetGUID;
+    ObjectGuid _stewGUID;
+    int32 _stewOldStandState = -1;
     bool _bribeFailed;
     bool _hoboRage;
     bool _flee;
+};
+
+// 42617 - Westfall Stew
+// 26271 - Feeding the Hungry and the Hopeless
+struct npc_westfall_westfall_stew : public ScriptedAI
+{
+    npc_westfall_westfall_stew(Creature* creature) : ScriptedAI(creature) {}
+
+    void IsSummonedBy(WorldObject* summoner) override
+    {
+        if (!summoner)
+            return;
+
+        std::vector<Creature*> homeless;
+        me->GetCreatureListWithEntryInGrid(homeless, Creatures::HomelessStormwindCitizen1, 8.0f);
+        me->GetCreatureListWithEntryInGrid(homeless, Creatures::HomelessStormwindCitizen2, 8.0f);
+        me->GetCreatureListWithEntryInGrid(homeless, Creatures::Transient, 8.0f);
+        me->GetCreatureListWithEntryInGrid(homeless, Creatures::WestPlainDrifter, 8.0f);
+        me->GetCreatureListWithEntryInGrid(homeless, Creatures::WestPlainsDrifterFollower, 8.0f);
+
+        for (Creature* citizen : homeless)
+        {
+            if (citizen->HasAura(Spells::FullBelly))
+                continue;
+
+            // a citizen fighting for its life cannot walk to the pot; skip it instead of locking it for 20s
+            if (citizen->IsInCombat())
+                continue;
+
+            citizen->AI()->SetGUID(me->GetGUID(), int32(Data::DataWestfallStew));
+        }
+    }
+};
+
+// 42383 / 42384 / 42386 / 42391 / 42400 - plain citizens fed by Westfall Stew
+// (the sentinel hill spawns instead run npc_westfall_hobo_witness, which feeds as well)
+struct npc_westfall_westfall_citizen : public ScriptedAI
+{
+    npc_westfall_westfall_citizen(Creature* creature) : ScriptedAI(creature) {}
+
+    void SetGUID(ObjectGuid const& guid, int32 id) override
+    {
+        if (id != int32(Data::DataWestfallStew))
+            return;
+
+        if (!_stewGUID.IsEmpty())
+            return;
+
+        _stewGUID = guid;
+        _events.ScheduleEvent(Events::WestfallStew::Start, 0ms, Events::WestfallStew::GroupStew);
+        // safety net: combat, a stuck path or a despawned stew would otherwise keep the citizen locked forever
+        _events.ScheduleEvent(Events::WestfallStew::Abort, 20s, Events::WestfallStew::GroupStew);
+    }
+
+    void MovementInform(uint32 type, uint32 id) override
+    {
+        if (type != POINT_MOTION_TYPE || id != 1)
+            return;
+
+        me->CastSpell(me, Spells::FullBelly, true);
+
+        if (Creature* stew = ObjectAccessor::GetCreature(*me, _stewGUID))
+        {
+            if (stew->IsSummon())
+                if (WorldObject* summoner = stew->ToTempSummon()->GetSummoner())
+                    if (Player* player = summoner->ToPlayer())
+                        player->KilledMonsterCredit(Creatures::WestfallStew);
+
+            if (roll_chance(50))
+            {
+                switch (me->GetEntry())
+                {
+                    case Creatures::HomelessStormwindCitizen1:
+                        Talk(Text::StewText::Citizen1, stew);
+                        break;
+                    case Creatures::HomelessStormwindCitizen2:
+                        Talk(Text::StewText::Citizen2, stew);
+                        break;
+                    case Creatures::Transient:
+                        Talk(Text::StewText::Transient, stew);
+                        break;
+                    case Creatures::WestPlainDrifter:
+                        Talk(Text::StewText::WestPlainsDrifter, stew);
+                        break;
+                    case Creatures::WestPlainsDrifterFollower:
+                        Talk(Text::StewText::DrifterFollower, stew);
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+
+        // Release the lock as soon as the meal is over, otherwise the citizen stays bound to a stew that
+        // no longer exists and ignores every following stew (Full Belly fades, but it never eats again).
+        _stewGUID.Clear();
+        _events.CancelEvent(Events::WestfallStew::Abort);
+        _events.ScheduleEvent(Events::WestfallStew::ReturnHome, 5s + 500ms, Events::WestfallStew::GroupStew);
+    }
+
+    void JustReachedHome() override
+    {
+        // back at the spawn point: restore the pose the citizen had before the stew showed up
+        if (_stewOldStandState < 0)
+            return;
+
+        if (_stewOldStandState == int32(UNIT_STAND_STATE_SLEEP) && !me->HasAura(Spells::CosmeticSleep))
+            me->CastSpell(me, Spells::CosmeticSleep, true);
+
+        me->SetStandState(UnitStandStateType(_stewOldStandState));
+        _stewOldStandState = -1;
+    }
+
+    void UpdateAI(uint32 diff) override
+    {
+        _events.Update(diff);
+        while (uint32 eventId = _events.ExecuteEvent())
+        {
+            switch (eventId)
+            {
+                case Events::WestfallStew::Start:
+                    // remember the original pose: the Sentinel Hill hobos sleep on the ground and have to go
+                    // back to it once the meal is over, otherwise they stand up for the rest of their life
+                    if (_stewOldStandState < 0)
+                        _stewOldStandState = int32(me->GetStandState());
+
+                    me->SetStandState(UNIT_STAND_STATE_STAND);
+
+                    if (me->HasAura(Spells::CosmeticSleep))
+                        me->RemoveAurasDueToSpell(Spells::CosmeticSleep);
+
+                    _events.ScheduleEvent(Events::WestfallStew::MoveToStew, 2s, Events::WestfallStew::GroupStew);
+                    break;
+                case Events::WestfallStew::MoveToStew:
+                {
+                    if (Creature* stew = ObjectAccessor::GetCreature(*me, _stewGUID))
+                    {
+                        float x, y, z;
+                        stew->GetContactPoint(me, x, y, z, 0.2f);
+                        me->GetMotionMaster()->MovePoint(1, x, y, z);
+                    }
+                    else
+                    {
+                        // the stew despawned on the way: unlock so the next one can feed us
+                        _stewGUID.Clear();
+                        _events.CancelEvent(Events::WestfallStew::Abort);
+                        me->GetMotionMaster()->MoveTargetedHome();
+                    }
+                    break;
+                }
+                case Events::WestfallStew::ReturnHome:
+                    _stewGUID.Clear();
+                    me->GetMotionMaster()->MoveTargetedHome();
+                    break;
+                case Events::WestfallStew::Abort:
+                    // never made it to the stew (combat, stuck path, despawn): unlock and head back
+                    _stewGUID.Clear();
+                    if (!me->IsInCombat())
+                        me->GetMotionMaster()->MoveTargetedHome();
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+
+private:
+    EventMap _events;
+    ObjectGuid _stewGUID;
+    int32 _stewOldStandState = -1;
 };
 
 // 79169 - Summon Ragamuffin Looter
@@ -1013,6 +1323,8 @@ void AddSC_westfall()
     RegisterCreatureAI(npc_westfall_thug);
     RegisterCreatureAI(npc_westfall_lous_parting_thoughts_trigger);
     RegisterCreatureAI(npc_westfall_small_time_hustler);
+    RegisterCreatureAI(npc_westfall_westfall_stew);
+    RegisterCreatureAI(npc_westfall_westfall_citizen);
 
     // Areatrigger
     new at_westfall_two_shoed_lou_thugs();
