@@ -17,6 +17,7 @@
 
 #include "CombatAI.h"
 #include "Containers.h"
+#include "Log.h"
 #include "CreatureAIImpl.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
@@ -45,6 +46,7 @@ namespace Creatures
     static constexpr uint32 LousPartingThoughtsTrigger = 42562;
     static constexpr uint32 Thug = 42387;
     static constexpr uint32 SmallTimeHustler = 42390;
+    static constexpr uint32 SentinelHillGuard = 42407;
 }
 
 namespace Quests
@@ -130,6 +132,40 @@ namespace Events
         static constexpr uint32 Abort = 14;    // safety net: unlocks a citizen that never reached the stew
         static constexpr uint32 GroupStew = 2; // must not collide with MurderWasTheCaseThatTheyGaveMe::GroupOOC
     }
+
+    // idle chit-chat for the homeless standing under the Sentinel Hill guards
+    namespace CitizenIdle
+    {
+        static constexpr uint32 Chatter      = 15;   // WestfallStew already uses 11-14 in the same switch
+        static constexpr uint32 GroupIdle    = 3;    // own group, so cancelling the stew events leaves it alone
+        static constexpr Milliseconds MinDelay = 45s;
+        static constexpr Milliseconds MaxDelay = 90s;
+        static constexpr uint32 Chance       = 30;
+        static constexpr float  GuardRange   = 30.0f;
+    }
+
+    // Sentinel Hill checkpoint: the refugee pair walks in, the guards send it away
+    namespace RefugeeWalk
+    {
+        static constexpr uint32 StartMove             = 1;
+        static constexpr uint32 CrimeSceneDrifterTalk  = 2;
+        static constexpr uint32 CrimeSceneTalk12       = 3;
+        static constexpr uint32 CrimeSceneTalk13       = 4;
+        static constexpr uint32 GuardWhereGoing        = 5;
+        static constexpr uint32 GateMeal               = 6;
+        static constexpr uint32 GuardCantRead          = 7;
+        static constexpr uint32 GuardNoBums            = 8;
+        static constexpr uint32 GateCurse              = 9;
+        static constexpr uint32 GateLeave              = 10;
+        static constexpr uint32 Cancel                 = 11;
+    }
+
+    // ... and the drifter walking behind it
+    namespace DrifterWalk
+    {
+        static constexpr uint32 CrimeSceneTalk1 = 1;
+        static constexpr uint32 CrimeSceneTalk2 = 2;
+    }
 }
 
 namespace Actions
@@ -143,7 +179,19 @@ namespace Actions
     {
         static constexpr uint32 ThugReset = 1;
     }
+    // refugee pair walking from the Furlbrow farm to the Sentinel Hill checkpoint
+    namespace RefugeeWalk
+    {
+        static constexpr uint32 CrimeScene = 1;
+        static constexpr uint32 GateMeal   = 2;
+        static constexpr uint32 GateCurse  = 3;
+        static constexpr uint32 GateLeave  = 4;
+    }
 }
+
+// the refugee walkthrough owns the checkpoint: while it runs the local homeless keep quiet,
+// otherwise a random "I'm starving!" would cut straight into the guard exchange
+bool RefugeeSceneRunning = false;
 
 namespace Data
 {
@@ -195,6 +243,40 @@ namespace Text
         static constexpr uint32 Transient = 17;         // 42383
         static constexpr uint32 WestPlainsDrifter = 11; // 42391
         static constexpr uint32 DrifterFollower = 6;    // 42400
+    }
+    // the eight "I'm starving!" lines live in group 6 on 42383 / 42384 / 42386 / 42391 only;
+    // 42400 reuses group 6 for its fed-by-stew line, so it is filtered out in HasIdleChatter()
+    namespace CitizenText
+    {
+        static constexpr uint32 IdleChatter = 6;
+    }
+    // 42383 - the refugee pair's leader, official group ids
+    namespace RefugeeText
+    {
+        static constexpr uint32 CrimeScene0 = 11;  // 42318
+        static constexpr uint32 CrimeScene1 = 12;  // 42321
+        static constexpr uint32 CrimeScene2 = 13;  // 42323
+        static constexpr uint32 GateMeal    = 14;  // 42342
+        static constexpr uint32 GateCurse   = 15;  // 42347
+        static constexpr uint32 GateLeave   = 16;  // 42348
+    }
+    // 42400 - the drifter walking behind it, official group ids
+    namespace DrifterText
+    {
+        static constexpr uint32 CrimeScene0 = 0;   // 42320
+        static constexpr uint32 CrimeScene1 = 1;   // 42322
+        static constexpr uint32 CrimeScene2 = 2;   // 42324
+        static constexpr uint32 GateMeal    = 3;   // 42342
+        static constexpr uint32 GateCurse   = 4;   // 42347
+        static constexpr uint32 GateLeave   = 5;   // 42348
+    }
+    // 42407 guards run SmartAI, we only push their creature_text groups
+    namespace SentinelHillGateText
+    {
+        static constexpr uint32 GuardWhoa       = 0;   // 42340
+        static constexpr uint32 GuardWhereGoing = 1;   // 42341
+        static constexpr uint32 GuardCantRead   = 2;   // 42344
+        static constexpr uint32 GuardNoBums     = 3;   // 42345
     }
 }
 
@@ -817,6 +899,12 @@ struct npc_westfall_westfall_citizen : public ScriptedAI
 {
     npc_westfall_westfall_citizen(Creature* creature) : ScriptedAI(creature) {}
 
+    void JustAppeared() override
+    {
+        _events.ScheduleEvent(Events::CitizenIdle::Chatter,
+            randtime(Events::CitizenIdle::MinDelay, Events::CitizenIdle::MaxDelay), Events::CitizenIdle::GroupIdle);
+    }
+
     void SetGUID(ObjectGuid const& guid, int32 id) override
     {
         if (id != int32(Data::DataWestfallStew))
@@ -937,6 +1025,321 @@ struct npc_westfall_westfall_citizen : public ScriptedAI
                     if (!me->IsInCombat())
                         me->GetMotionMaster()->MoveTargetedHome();
                     break;
+                case Events::CitizenIdle::Chatter:
+                    IdleChatter();
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+
+protected:
+    // 45-90 s tick, 30 % roll: the citizen mutters one of the eight "I'm starving!" lines.
+    // Only spawns that actually have a Sentinel Hill guard at hand join in, so the camps far
+    // away from both checkpoints keep their old, silent behaviour.
+    void IdleChatter()
+    {
+        _events.ScheduleEvent(Events::CitizenIdle::Chatter,
+            randtime(Events::CitizenIdle::MinDelay, Events::CitizenIdle::MaxDelay), Events::CitizenIdle::GroupIdle);
+
+        if (!_idleChatterKnown)
+        {
+            _idleChatter = HasIdleChatter();
+            _idleChatterKnown = true;
+        }
+
+        if (!_idleChatter || !_stewGUID.IsEmpty() || me->IsInCombat() || !me->IsAlive())
+            return;
+
+        // asleep, or the checkpoint scene is playing: no small talk
+        if (me->GetStandState() == uint8(UNIT_STAND_STATE_SLEEP) || RefugeeSceneRunning)
+            return;
+
+        if (!roll_chance(Events::CitizenIdle::Chance))
+            return;
+
+        Talk(uint8(Text::CitizenText::IdleChatter));
+    }
+
+    virtual bool HasIdleChatter() const
+    {
+        // group 6 carries the chit-chat lines on these four entries only; on 42400 the same
+        // group id is the fed-by-stew line, so the drifter follower is left out on purpose
+        switch (me->GetEntry())
+        {
+            case Creatures::Transient:
+            case Creatures::HomelessStormwindCitizen1:
+            case Creatures::HomelessStormwindCitizen2:
+            case Creatures::WestPlainDrifter:
+                break;
+            default:
+                return false;
+        }
+
+        std::vector<Creature*> guards;
+        me->GetCreatureListWithEntryInGrid(guards, Creatures::SentinelHillGuard, Events::CitizenIdle::GuardRange);
+        return !guards.empty();
+    }
+
+    EventMap _events;
+    ObjectGuid _stewGUID;
+    int32 _stewOldStandState = -1;
+    bool _idleChatter = false;
+    bool _idleChatterKnown = false;
+};
+
+// 274913 - the citizen sitting on the checkpoint bench. It is fed by the Westfall Stew like
+// every other one (the stew looks the citizens up by entry, not by script), but it never
+// joins the chit-chat. Only this single spawn gets the override, through creature.ScriptName.
+struct npc_westfall_westfall_citizen_quiet : public npc_westfall_westfall_citizen
+{
+    npc_westfall_westfall_citizen_quiet(Creature* creature) : npc_westfall_westfall_citizen(creature) {}
+
+protected:
+    bool HasIdleChatter() const override { return false; }
+};
+
+// ---------------------------------------------------------------------------
+// 42383 (guid 280420) - leader of the refugee pair that walks from the Furlbrow
+// pumpkin farm to the Sentinel Hill checkpoint. Path 4238300 pauses at node 1
+// (crime scene, 33 s) and node 39 (checkpoint, 42 s); node 43 ends the run.
+//
+// The two checkpoint guards (42407) keep their plain SmartAI: this script talks
+// through them with AI()->Talk(), so the whole exchange runs on one clock.
+// ---------------------------------------------------------------------------
+struct npc_westfall_refugee_bridge_to_sentinelhill : public ScriptedAI
+{
+    npc_westfall_refugee_bridge_to_sentinelhill(Creature* creature) : ScriptedAI(creature) {}
+
+    static constexpr uint32 PathId                = Creatures::Transient * 100;  // 4238300
+    static constexpr uint32 PointCrimeScene       = 1;
+    static constexpr uint32 PointSentinelHillGate = 39;
+    static constexpr uint32 PointDespawn          = 43;
+    static constexpr float  DrifterSearchRange    = 8.0f;
+    static constexpr float  GuardSearchRange      = 12.0f;
+
+    void JustAppeared() override
+    {
+        RefugeeSceneRunning = true;
+        _events.ScheduleEvent(Events::RefugeeWalk::StartMove, 4s);
+    }
+
+    void MovementInform(uint32 type, uint32 pointId) override
+    {
+        if (type != WAYPOINT_MOTION_TYPE)
+            return;
+
+        switch (pointId)
+        {
+            case PointCrimeScene:
+                Talk(uint8(Text::RefugeeText::CrimeScene0));
+                _events.ScheduleEvent(Events::RefugeeWalk::CrimeSceneDrifterTalk, 6s);
+                break;
+            case PointSentinelHillGate:
+                StartGateScene();
+                break;
+            case PointDespawn:
+                _events.ScheduleEvent(Events::RefugeeWalk::Cancel, 0s);
+                break;
+            default:
+                break;
+        }
+    }
+
+    void UpdateAI(uint32 diff) override
+    {
+        _events.Update(diff);
+
+        while (uint32 eventId = _events.ExecuteEvent())
+        {
+            switch (eventId)
+            {
+                case Events::RefugeeWalk::StartMove:
+                    me->GetMotionMaster()->MovePath(PathId, false);
+                    break;
+                case Events::RefugeeWalk::CrimeSceneDrifterTalk:
+                    if (Creature* drifter = me->FindNearestCreature(Creatures::WestPlainsDrifterFollower, DrifterSearchRange))
+                    {
+                        _drifterGUID = drifter->GetGUID();
+                        if (drifter->IsAIEnabled())
+                            drifter->AI()->DoAction(Actions::RefugeeWalk::CrimeScene);
+                    }
+                    _events.ScheduleEvent(Events::RefugeeWalk::CrimeSceneTalk12, 6s);
+                    break;
+                case Events::RefugeeWalk::CrimeSceneTalk12:
+                    Talk(uint8(Text::RefugeeText::CrimeScene1));
+                    _events.ScheduleEvent(Events::RefugeeWalk::CrimeSceneTalk13, 12s);
+                    break;
+                case Events::RefugeeWalk::CrimeSceneTalk13:
+                    Talk(uint8(Text::RefugeeText::CrimeScene2));
+                    break;
+                case Events::RefugeeWalk::GuardWhereGoing:
+                    GuardTalk(_guard1GUID, Text::SentinelHillGateText::GuardWhereGoing);
+                    break;
+                case Events::RefugeeWalk::GateMeal:
+                    SayOrDelegate(Text::RefugeeText::GateMeal, Actions::RefugeeWalk::GateMeal);
+                    break;
+                case Events::RefugeeWalk::GuardCantRead:
+                    GuardTalk(_guard2GUID, Text::SentinelHillGateText::GuardCantRead);
+                    break;
+                case Events::RefugeeWalk::GuardNoBums:
+                    GuardTalk(_guard2GUID, Text::SentinelHillGateText::GuardNoBums);
+                    break;
+                case Events::RefugeeWalk::GateCurse:
+                    SayOrDelegate(Text::RefugeeText::GateCurse, Actions::RefugeeWalk::GateCurse);
+                    break;
+                case Events::RefugeeWalk::GateLeave:
+                    SayOrDelegate(Text::RefugeeText::GateLeave, Actions::RefugeeWalk::GateLeave);
+                    break;
+                case Events::RefugeeWalk::Cancel:
+                    DespawnPair();
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+
+private:
+    // the two checkpoint guards stand at fixed posts, identified by home position
+    void StartGateScene()
+    {
+        Creature* guard1 = nullptr;
+        Creature* guard2 = nullptr;
+
+        std::vector<Creature*> guards;
+        me->GetCreatureListWithEntryInGrid(guards, Creatures::SentinelHillGuard, GuardSearchRange);
+
+        for (Creature* guard : guards)
+        {
+            if (guard->GetHomePosition().GetExactDist2d(-10341.4f, 978.075f) < 0.1f)
+                guard1 = guard;
+            else if (guard->GetHomePosition().GetExactDist2d(-10341.3f, 981.691f) < 0.1f)
+                guard2 = guard;
+
+            if (guard1 && guard2)
+                break;
+        }
+
+        if (!guard1 || !guard2 || guard1->IsInCombat() || guard2->IsInCombat())
+        {
+            _events.ScheduleEvent(Events::RefugeeWalk::Cancel, 5min);
+            return;
+        }
+
+        _guard1GUID = guard1->GetGUID();
+        _guard2GUID = guard2->GetGUID();
+
+        // official beat: guard A opens, guard B cuts in at 17 s, the pair is sent
+        // off at 32.5 / 38.5 s - the path then carries them away
+        GuardTalk(_guard1GUID, Text::SentinelHillGateText::GuardWhoa);
+        _events.ScheduleEvent(Events::RefugeeWalk::GuardWhereGoing, 4s);
+        _events.ScheduleEvent(Events::RefugeeWalk::GateMeal, 10s);
+        _events.ScheduleEvent(Events::RefugeeWalk::GuardCantRead, 17s);
+        _events.ScheduleEvent(Events::RefugeeWalk::GuardNoBums, 23s);
+        _events.ScheduleEvent(Events::RefugeeWalk::GateCurse, 32500ms);
+        _events.ScheduleEvent(Events::RefugeeWalk::GateLeave, 38500ms);
+        _events.ScheduleEvent(Events::RefugeeWalk::Cancel, 150s);   // backstop
+    }
+
+    Creature* GetDrifter()
+    {
+        if (Creature* drifter = ObjectAccessor::GetCreature(*me, _drifterGUID))
+            return drifter;
+
+        return me->FindNearestCreature(Creatures::WestPlainsDrifterFollower, 30.0f);
+    }
+
+    void GuardTalk(ObjectGuid const& guid, uint32 textId)
+    {
+        if (Creature* guard = ObjectAccessor::GetCreature(*me, guid))
+            if (guard->IsAIEnabled())
+                guard->AI()->Talk(uint8(textId));
+    }
+
+    // official rolls 50/50 between the leader and the drifter for these lines
+    void SayOrDelegate(uint32 leaderText, uint32 drifterAction)
+    {
+        if (urand(1, 100) <= 50)
+        {
+            Talk(uint8(leaderText));
+            return;
+        }
+
+        if (Creature* drifter = GetDrifter())
+        {
+            if (drifter->IsAIEnabled())
+            {
+                drifter->AI()->DoAction(drifterAction);
+                return;
+            }
+        }
+
+        Talk(uint8(leaderText));
+    }
+
+    void DespawnPair()
+    {
+        RefugeeSceneRunning = false;
+
+        if (Creature* drifter = GetDrifter())
+            drifter->DespawnOrUnsummon();
+
+        me->DespawnOrUnsummon();
+    }
+
+    EventMap _events;
+    ObjectGuid _drifterGUID;
+    ObjectGuid _guard1GUID;
+    ObjectGuid _guard2GUID;
+};
+
+// ---------------------------------------------------------------------------
+// 42400 (guid 280419) - the drifter walking behind the leader. Says the crime
+// scene half, and takes over some of the gate lines on the leader's 50/50 roll.
+// ---------------------------------------------------------------------------
+struct npc_westfall_west_plains_drifter_walk_to_sentinel : public ScriptedAI
+{
+    npc_westfall_west_plains_drifter_walk_to_sentinel(Creature* creature) : ScriptedAI(creature) {}
+
+    void DoAction(int32 action) override
+    {
+        switch (action)
+        {
+            case Actions::RefugeeWalk::CrimeScene:
+                Talk(uint8(Text::DrifterText::CrimeScene0));
+                _events.ScheduleEvent(Events::DrifterWalk::CrimeSceneTalk1, 12s);
+                break;
+            case Actions::RefugeeWalk::GateMeal:
+                Talk(uint8(Text::DrifterText::GateMeal));
+                break;
+            case Actions::RefugeeWalk::GateCurse:
+                Talk(uint8(Text::DrifterText::GateCurse));
+                break;
+            case Actions::RefugeeWalk::GateLeave:
+                Talk(uint8(Text::DrifterText::GateLeave));
+                break;
+            default:
+                break;
+        }
+    }
+
+    void UpdateAI(uint32 diff) override
+    {
+        _events.Update(diff);
+
+        while (uint32 eventId = _events.ExecuteEvent())
+        {
+            switch (eventId)
+            {
+                case Events::DrifterWalk::CrimeSceneTalk1:
+                    Talk(uint8(Text::DrifterText::CrimeScene1));
+                    _events.ScheduleEvent(Events::DrifterWalk::CrimeSceneTalk2, 11s);
+                    break;
+                case Events::DrifterWalk::CrimeSceneTalk2:
+                    Talk(uint8(Text::DrifterText::CrimeScene2));
+                    break;
                 default:
                     break;
             }
@@ -945,8 +1348,6 @@ struct npc_westfall_westfall_citizen : public ScriptedAI
 
 private:
     EventMap _events;
-    ObjectGuid _stewGUID;
-    int32 _stewOldStandState = -1;
 };
 
 // 79169 - Summon Ragamuffin Looter
@@ -1325,6 +1726,9 @@ void AddSC_westfall()
     RegisterCreatureAI(npc_westfall_small_time_hustler);
     RegisterCreatureAI(npc_westfall_westfall_stew);
     RegisterCreatureAI(npc_westfall_westfall_citizen);
+    RegisterCreatureAI(npc_westfall_westfall_citizen_quiet);
+    RegisterCreatureAI(npc_westfall_refugee_bridge_to_sentinelhill);
+    RegisterCreatureAI(npc_westfall_west_plains_drifter_walk_to_sentinel);
 
     // Areatrigger
     new at_westfall_two_shoed_lou_thugs();
