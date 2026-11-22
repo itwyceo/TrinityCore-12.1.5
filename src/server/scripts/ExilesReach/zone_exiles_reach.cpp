@@ -36,6 +36,7 @@
 #include "SpellInfo.h"
 #include "SpellScript.h"
 #include "TemporarySummon.h"
+#include "Vehicle.h"
 #include "VehicleDefines.h"
 #include "WorldStateMgr.h"
 
@@ -6024,6 +6025,7 @@ class spell_knockback_hint_q56034 : public SpellScript
 enum CaptainGarrickGiantBoar
 {
     ACTION_EXIT_BOAR                                        = 1,
+    ACTION_START_RIDE_BOAR                                  = 2,
 
     ACTOR_HENRY_GARRICK_PRISONER                            = 78493,
 
@@ -6037,6 +6039,7 @@ enum CaptainGarrickGiantBoar
     EVENT_CAPTAIN_GARRICK_RIDE_BOAR_TALK_TO_HENRY           = 3,
     EVENT_CAPTAIN_GARRICK_RIDE_BOAR_HENRY_DESPAWN           = 4,
     EVENT_CAPTAIN_GARRICK_RIDE_BOAR_EXIT_BOAR_CONVERSATION  = 5,
+    EVENT_CAPTAIN_GARRICK_VERIFY_BOARD                      = 6,
 
     NPC_GIANT_BOAR                                          = 156267,
 
@@ -6085,14 +6088,7 @@ struct npc_captain_garrick_q55879 : public ScriptedAI
         {
             case SPELL_PING_GARRICK_TO_RIDE_BOAR:
             {
-                Unit* owner = me->GetOwner();
-                if (!owner)
-                    break;
-
-                PhasingHandler::InheritPhaseShift(me, owner);
-                PhasingHandler::ResetPhaseShift(me);
-
-                _events.ScheduleEvent(EVENT_CAPTAIN_GARRICK_RIDE_BOAR, 2s);
+                StartRideBoar();
                 break;
             }
             case SPELL_ENHANCED_BOAR_PING_VEHICLE:
@@ -6135,15 +6131,48 @@ struct npc_captain_garrick_q55879 : public ScriptedAI
             {
                 case EVENT_CAPTAIN_GARRICK_RIDE_BOAR:
                 {
-                    if (Unit* owner = me->GetOwner())
-                    {
-                        Creature* boar = owner->FindNearestCreatureWithOptions(10.0f, { .CreatureId = NPC_GIANT_BOAR, .OwnerGuid = owner->GetGUID() });
-                        if (!boar)
-                            return;
+                    Player* player = ObjectAccessor::GetPlayer(*me, _ownerPlayerGUID);
+                    if (!player)
+                        player = me->SelectNearestPlayer(60.0f);
+                    if (!player)
+                        break;
 
-                        boar->SetControlled(false, UNIT_STATE_ROOT);
-                        me->CastSpell(boar, SPELL_RIDE_VEHICLE_CAPTIAN_BOAR);
+                    // 猪是玩家的私有对象，必须借玩家的视角查；加里克自己查会被 IgnoreNotOwnedPrivateObjects 过滤掉
+                    Creature* boar = player->FindNearestCreatureWithOptions(30.0f, { .CreatureId = NPC_GIANT_BOAR, .OwnerGuid = player->GetGUID() });
+                    if (!boar)
+                        boar = player->FindNearestCreature(NPC_GIANT_BOAR, 30.0f);
+
+                    TC_LOG_INFO("scripts", "Q55879 Garrick {} RIDE_BOAR: player={}, boar={}", me->GetGUID().ToString(),
+                        player->GetName(), boar ? boar->GetGUID().ToString() : "<none>");
+
+                    if (!boar)
+                        break;
+
+                    // 解定身必须做：野猪在玩家上车时被 ROOT，不解玩家没法控制方向
+                    boar->SetControlled(false, UNIT_STATE_ROOT);
+
+                    _boarGUID = boar->GetGUID();
+
+                    // 63315 在客户端数据里效果不全（实测加里克上不去），直接走硬编码上车 46598 的 1 号座位
+                    me->EnterVehicle(boar, 1);
+                    _events.ScheduleEvent(EVENT_CAPTAIN_GARRICK_VERIFY_BOARD, 1500ms);
+                    break;
+                }
+                case EVENT_CAPTAIN_GARRICK_VERIFY_BOARD:
+                {
+                    if (me->GetVehicle())
+                    {
+                        TC_LOG_INFO("scripts", "Q55879 Garrick {} boarded boar successfully", me->GetGUID().ToString());
+                        break;
                     }
+
+                    if (Creature* boar = ObjectAccessor::GetCreature(*me, _boarGUID))
+                    {
+                        TC_LOG_INFO("scripts", "Q55879 Garrick {} retry boarding boar {}", me->GetGUID().ToString(), _boarGUID.ToString());
+                        me->EnterVehicle(boar, 1);
+                    }
+                    else
+                        TC_LOG_INFO("scripts", "Q55879 Garrick {} retry failed: boar {} gone", me->GetGUID().ToString(), _boarGUID.ToString());
                     break;
                 }
                 case EVENT_CAPTAIN_GARRICK_RIDE_BOAR_TALK_TO_HENRY:
@@ -6199,9 +6228,47 @@ struct npc_captain_garrick_q55879 : public ScriptedAI
 
         UpdateVictim();
     }
+
+    void DoAction(int32 action) override
+    {
+        if (action == ACTION_START_RIDE_BOAR)
+            StartRideBoar();
+    }
+
 private:
+    // SPELL_PING_GARRICK_TO_RIDE_BOAR 在部分客户端数据里没有效果，载具那边会直接调 DoAction 兜底，
+    // 这里用标记去重，保证两条路同时存在时只上猪一次
+    void StartRideBoar()
+    {
+        if (_boarRideStarted)
+            return;
+
+        // 174955 不一定是召唤物（场景/手动生成时 OwnerGUID 是空的），
+        // 之前这里直接 return 导致加里克永远不上猪。补一层“最近玩家”兜底。
+        Player* player = me->GetCharmerOrOwnerPlayerOrPlayerItself();
+        if (!player)
+            player = me->SelectNearestPlayer(60.0f);
+
+        TC_LOG_INFO("scripts", "Q55879 Garrick {} StartRideBoar: owner={}, player={}", me->GetGUID().ToString(),
+            me->GetOwnerGUID().ToString(), player ? player->GetName() : "<none>");
+
+        if (!player)
+            return;
+
+        _boarRideStarted = true;
+        _ownerPlayerGUID = player->GetGUID();
+
+        PhasingHandler::InheritPhaseShift(me, player);
+        PhasingHandler::ResetPhaseShift(me);
+
+        _events.ScheduleEvent(EVENT_CAPTAIN_GARRICK_RIDE_BOAR, 2s);
+    }
+
     EventMap _events;
     ObjectGuid _henryGUID;
+    ObjectGuid _boarGUID;
+    ObjectGuid _ownerPlayerGUID;
+    bool _boarRideStarted = false;
 };
 
 enum GiantBoar
@@ -6212,6 +6279,8 @@ enum GiantBoar
     EVENT_GIANT_BOAR_SIZE_FOUR          = 4,
     EVENT_GIANT_BOAR_EJECT_PASSENGERS   = 5,
     EVENT_GIANT_BOAR_UNROOT             = 6,
+    EVENT_GIANT_BOAR_BOARD_UNROOT       = 7,
+    EVENT_GIANT_BOAR_RESTORE_CONTROL    = 8,
 
     SOUND_ENLARGE_BOAR                  = 157516,
     SOUND_SHRINK_BOAR                   = 157517,
@@ -6236,14 +6305,37 @@ struct npc_giant_boar_vehicle_q55879 : public VehicleAI
     {
         if (apply && passenger->IsPlayer())
         {
+            // 刚上猪的 2 秒先定身，等加里克爬上来（官方行为：加里克上车后自己会解定身）。
+            // 这里额外挂一个 2 秒的兜底解定身，避免加里克没上来时野猪一直 ROOT —— 那样玩家
+            // 方向键完全无效、只能点技能，退出载具后客户端也还停在载具状态。
             me->SetControlled(true, UNIT_STATE_ROOT);
-            passenger->SetMovedUnit(me);
+            _events.ScheduleEvent(EVENT_GIANT_BOAR_BOARD_UNROOT, 2s);
+
             passenger->CastSpell(passenger, SPELL_PING_GARRICK_TO_RIDE_BOAR); // Ping Garrick to ride Boar (DNT)
             passenger->CastSpell(passenger, SPELL_UPDATE_PHASE_SHIFT);
+
+            // 316984 在部分客户端数据里是空法术（没有命中就没有 SpellHit），这里直接通知加里克上猪，
+            // 加里克那边用标记去重，所以两条路同时存在时也只会执行一次
+            NotifyGarrickToRide(passenger->ToPlayer());
         }
         else if (apply && passenger->IsCreature())
         {
             passenger->ChangeSeat(VEHICLE_BOAR_SEAT_ONE);
+        }
+        else if (!apply && passenger->IsPlayer())
+        {
+            // 下车：把客户端控制权/视角/移动主体交还玩家本体。
+            // 正常路径由 RemoveCharmedBy 完成，这里补一道，避免动作条卡在载具技能页面。
+            _events.CancelEvent(EVENT_GIANT_BOAR_BOARD_UNROOT);
+            me->SetControlled(false, UNIT_STATE_ROOT);
+
+            Player* player = passenger->ToPlayer();
+            // RemoveCharmedBy 里那句 SendRemoveControlBar 带 this != charmer->GetFirstControlled()
+            // 的前置条件，载具场景下经常不成立（清 charm 前后指针关系不同），客户端就一直留着
+            // 载具技能条。这里显式再发一次空的 PetSpells，客户端收到才会把动作条切回普通页。
+            player->SetClientControl(player, true);
+            player->SendRemoveControlBar();
+            _events.ScheduleEvent(EVENT_GIANT_BOAR_RESTORE_CONTROL, 1s);
         }
     }
 
@@ -6264,15 +6356,23 @@ struct npc_giant_boar_vehicle_q55879 : public VehicleAI
 
     void UpdateAI(uint32 diff) override
     {
-        if (!_endOfScene)
-            return;
-
+        // 注意：上猪/下车用的事件也要跑，所以这里不能再按 _endOfScene 提前 return
         _events.Update(diff);
 
         while (uint32 eventId = _events.ExecuteEvent())
         {
             switch (eventId)
             {
+                case EVENT_GIANT_BOAR_BOARD_UNROOT:
+                    // 加里克没能在 2 秒内上车时也要解定身，否则玩家开不动这头猪
+                    me->SetControlled(false, UNIT_STATE_ROOT);
+                    break;
+                case EVENT_GIANT_BOAR_RESTORE_CONTROL:
+                    if (Unit* owner = me->GetOwner())
+                        if (Player* player = owner->ToPlayer())
+                            if (!player->GetVehicle())
+                                player->SetClientControl(player, true);
+                    break;
                 case EVENT_GIANT_BOAR_SIZE_ONE:
                     me->PlayDirectSound(SOUND_ENLARGE_BOAR);
                     me->SetObjectScale(1.2f);
@@ -6306,8 +6406,90 @@ struct npc_giant_boar_vehicle_q55879 : public VehicleAI
         }
     }
 private:
+    void NotifyGarrickToRide(Player* player)
+    {
+        if (!player)
+            return;
+
+        // OwnerGuid 读的是 creature 的 SummonedBy 字段；个人召唤物如果没设置 owner 就查不到，
+        // 所以再退一步按条目 + 私有对象过滤查（默认 IgnoreNotOwnedPrivateObjects 会排除别人的猪）
+        Creature* garrick = player->FindNearestCreatureWithOptions(60.0f,
+            { .CreatureId = NPC_ALLIANCE_CAPTAIN, .OwnerGuid = player->GetGUID() });
+        if (!garrick)
+            garrick = player->FindNearestCreature(NPC_ALLIANCE_CAPTAIN, 60.0f);
+
+        TC_LOG_INFO("scripts", "Q55879 boar {} boarded by {}: garrick={}", me->GetGUID().ToString(),
+            player->GetName(), garrick ? garrick->GetGUID().ToString() : "<not found in 60yd>");
+
+        if (garrick)
+            garrick->AI()->DoAction(ACTION_START_RIDE_BOAR);
+    }
+
     EventMap _events;
     bool _endOfScene;
+};
+
+enum GiantBoarDisplayQ55879
+{
+    NPC_GIANT_BOAR_VEHICLE_Q55879   = 156267
+};
+
+constexpr float GIANT_BOAR_LOOKUP_RANGE = 40.0f;
+
+// 156595 - Giant Boar（地上的巨型野猪，任务 55879 的点击目标）
+// 模板里它只有 SPELLCLICK 旗标、没有载具（VehicleId = 0），所以点它本身坐不上去。
+// 点一下：给它召唤一头属于该玩家的个人载具野猪 156267，并把玩家放进 0 号座位，
+// 之后 156267 的 npc_giant_boar_vehicle_q55879 接管（定身、ping 加里克、缩放、冲锋）。
+struct npc_giant_boar_display_q55879 : public ScriptedAI
+{
+    npc_giant_boar_display_q55879(Creature* creature) : ScriptedAI(creature) { }
+
+    void OnSpellClick(Unit* clicker, bool /*spellClickHandled*/) override
+    {
+        Player* player = clicker->ToPlayer();
+        if (!player || player->GetVehicleBase())
+            return;
+
+        // 与 conditions(type 47, quest 55879, INCOMPLETE) 保持一致：
+        // OnSpellClick 不会被 conditions 拦住，这里自己挡一道，避免没接任务就上猪后卡在定身状态
+        if (player->GetQuestStatus(QUEST_RIDE_ENHANCED_BOAR) != QUEST_STATUS_INCOMPLETE)
+            return;
+
+        Creature* boar = player->FindNearestCreatureWithOptions(GIANT_BOAR_LOOKUP_RANGE,
+            { .CreatureId = NPC_GIANT_BOAR_VEHICLE_Q55879, .OwnerGuid = player->GetGUID() });
+
+        if (!boar)
+            boar = player->FindNearestCreature(NPC_GIANT_BOAR_VEHICLE_Q55879, GIANT_BOAR_LOOKUP_RANGE);
+
+        if (!boar)
+        {
+            // privateObjectOwner = 玩家：只有本人看得到这头猪
+            boar = player->SummonCreature(NPC_GIANT_BOAR_VEHICLE_Q55879, me->GetPosition(),
+                TEMPSUMMON_MANUAL_DESPAWN, 0s, 0, 0, player->GetGUID());
+
+            if (!boar)
+                return;
+        }
+
+        // SummonCreature 传的是 properties = nullptr，TempSummon::InitStats 会在写 owner 之前就
+        // return，导致这头猪的 SummonedBy（GetOwnerGUID）是空的 —— 加里克脚本里
+        // FindNearestCreatureWithOptions(... .OwnerGuid = owner) 就永远找不到它，
+        // 于是既不上猪、也不解定身，玩家坐在上面完全动不了。这里补上 owner。
+        boar->SetOwnerGUID(player->GetGUID());
+
+        // 客户端要靠载具信息（VehicleRecID）才会把 charm 的界面切成载具框 + 载具动作条，
+        // 否则一律按“宠物”显示（宠物框 + 带攻击/跟随/停留的宠物条）。
+        // 动态召唤的载具走 Creature::CreateFromProto -> CreateVehicleKit(..., loading = true)，
+        // 这条路不发 SMSG_SET_VEHICLE_REC_ID，客户端只能从 create block 的 vehicle 位里拿。
+        // SummonCreature 的 create block 要等本 tick 的 object update 才 flush，紧接着的
+        // EnterVehicle 却会立刻发 SMSG_PET_SPELLS —— 客户端先按宠物建好界面就不会再刷新了。
+        // 所以这里手动把 create block 推出去，再显式补一条 vehicle rec id，最后才进载具。
+        boar->SendUpdateToPlayer(player);
+        if (Vehicle* kit = boar->GetVehicleKit())
+            boar->SendSetVehicleRecId(kit->GetVehicleInfo()->ID);
+
+        player->EnterVehicle(boar, 0);
+    }
 };
 
 enum TorgokData
@@ -7015,6 +7197,7 @@ void AddSC_zone_exiles_reach()
     RegisterSpellScript(spell_knockback_hint_q56034);
     RegisterCreatureAI(npc_captain_garrick_q55879);
     RegisterCreatureAI(npc_giant_boar_vehicle_q55879);
+    RegisterCreatureAI(npc_giant_boar_display_q55879);
     RegisterCreatureAI(npc_torgok_q55879);
     new FactoryCreatureScript<CreatureAI, &PrisonerQ55879Selector>("npc_prisoner_q55879");
     // The Re-Deather
