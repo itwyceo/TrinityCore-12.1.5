@@ -1,4 +1,4 @@
-/*
+﻿/*
  * This file is part of the TrinityCore Project. See AUTHORS file for Copyright information
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -21,13 +21,16 @@
 #include "CellImpl.h"
 #include "CombatAI.h"
 #include "Containers.h"
+#include "ConditionMgr.h"
 #include "Conversation.h"
 #include "CreatureTextMgr.h"
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
 #include "GameObject.h"
+#include "MapManager.h"
 #include "MapUtils.h"
 #include "MotionMaster.h"
+#include "MoveSpline.h"
 #include "ObjectAccessor.h"
 #include "PassiveAI.h"
 #include "PathGenerator.h"
@@ -43,6 +46,9 @@
 #include "TemporarySummon.h"
 #include "Vehicle.h"
 #include "VehicleDefines.h"
+#include "WaypointManager.h"
+
+#include <cmath>
 #include "WorldStateMgr.h"
 
 template<class privateAI, class publicAI>
@@ -7115,7 +7121,8 @@ enum WhoLurksInThePitQ55639
     EVENT_RALIA_HELP_CHECK          = 8,
     EVENT_RALIA_SHAKE               = 9,
     EVENT_RALIA_SHIFT               = 12,
-    EVENT_RALIA_WALK_GUARD          = 13,
+    EVENT_RALIA_CLIMB_FALLBACK      = 13,
+    EVENT_RALIA_ARM_RIDE            = 14,
 
     // Same spell the Seething Shore battleground casts on every player when the
     // azerite geysers erupt (battleground_seething_shore.cpp: "EarthQuakeCameraShake").
@@ -7124,13 +7131,17 @@ enum WhoLurksInThePitQ55639
     // lost its shake field, so the shake has to come from a spell.
     SPELL_CAMERA_SHAKE              = 248719,
 
-    // waypoint_path shipped with the world database: 23 nodes running from the
-    // pit floor (z=-30.5) up the gallery to the surface (z=89.3), 703 yards.
-    // The ride stops at node 22 (86.4, -2244.5, 93.8): Captain Garrick's spawn
-    // point 8001001 is (87.0, -2246.5, 94.5), two yards away, while node 23 is
-    // a bare ledge 80 yards further down the slope with nothing on it.
+    // waypoint_path from the world database: 22 nodes running from the pit floor
+    // (z=-30.5) up the gallery to the surface, 703 yards. Two were added on top
+    // (see fix_ralia_path_end_wall.sql) so the last leg climbs the cliff face:
+    //   node 22 (86.4, -2244.5, 87.2)      - foot of the wall, 6.6 yd below the lip
+    //   node 23 (86.4, -2244.5, 93.7894)   - straight up the wall, onto the ledge
+    // Node 23 IS the old end point, so Captain Garrick (spawn 8001001 at 87.0,
+    // -2246.5, 94.48) is still two yards away and the ride still stops in his
+    // face. The single node 21 -> 22 diagonal it replaced climbed 10.7 yd in one
+    // leg and read as the stag sliding up through the rock.
     RALIA_ESCAPE_PATH               = 156929,
-    RALIA_ESCAPE_LAST_NODE          = 22,
+    RALIA_ESCAPE_LAST_NODE          = 23,
 
     // 91010 is the display every other Ralia Dreamchaser in the zone uses
     // (156902 / 156907 / 156932 / 156944 / 156947 / 164907 / 232800), i.e. the
@@ -7142,7 +7153,7 @@ enum WhoLurksInThePitQ55639
     // on this client it renders as the stag. That is why she was a deer from
     // the moment she spawned, no matter what the script did.
     DISPLAY_RALIA_NIGHTELF          = 91010,
-    DISPLAY_RALIA_STAG              = 127129,
+    DISPLAY_RALIA_STAG              = 73350,
 
     // Last resort if the client has no 91010: 37729 is what the other Ralia in
     // the pit (156930) uses, so the client definitely carries it.
@@ -7159,12 +7170,10 @@ enum WhoLurksInThePitQ55639
     GO_FLAME_EMITTER                = 1607,
     GO_FLAME_LIFETIME               = 8,
 
-    // Hrun's altar is flanked by a pair of lit braziers. Retail builds them
-    // inside the client scene, and the world database ships nothing at all for
-    // the pit floor, so the script spawns the pair itself: a Fiery Brazier for
-    // the stand plus a flame emitter on top so it reads as burning either way.
-    GO_RITUAL_BRAZIER               = 37089,
-    GO_RITUAL_BRAZIER_LIFETIME      = 300,
+    // The two braziers flanking Hrun's altar already exist in the world; the
+    // scene only lights them, so all that gets spawned here is the flame
+    // emitter at each of the two prop anchors.
+    GO_RITUAL_FIRE_LIFETIME         = 300,
 
     // Hrun's own ability from the dungeon journal: "Drain Spirit - Drains
     // health from an enemy over 5 sec, transferring it to the caster." That is
@@ -7184,31 +7193,362 @@ enum WhoLurksInThePitQ55639
 
 constexpr float RALIA_RIDE_SPEED = 16.0f;   // yd/s, about twice a mounted player
 constexpr float RALIA_TWO_PI     = 6.2831853f;
-// creature_model_info: 127129 has BoundingRadius 5.36 / CombatReach 8.0 while
-// the night elf display 73350 has 1.16 / 0.70, i.e. the stag model is 4.6x
-// bigger. Scale it back so she reads as a rideable stag and not a giant.
-constexpr float RALIA_STAG_SCALE = 0.65f;
 
-// While Hrun drains her, Ralia hangs off the floor. Retail renders that inside
-// a client scene; the server-side equivalent is the hover movement flag, which
-// makes the client hold her at HoverHeight above the ground and play the
-// legs-dangling hover idle, so she reads as suspended rather than standing.
-constexpr float RALIA_CAPTIVE_HOVER = 3.0f;
+// Where she comes down when the ritual breaks: Hrun's own position, so the drop
+// reads as "the ritual ends and she falls where he stood". Her spawn row sits
+// five yards to the side of him, which is where a plain MoveFall() put her -
+// the scene wants her on the altar, not next to it. Hard-coded on purpose:
+// ReleaseFromCaptiveState() also runs from the gossip fallback, by which time
+// Hrun may already be a despawned corpse.
+constexpr float RALIA_DROP_X = 69.4234f;
+constexpr float RALIA_DROP_Y = -2121.94f;
 
-// Where she stands once the ritual breaks, still in night elf form. The scene
-// walks her off the altar to this spot and she says her line from here before
-// shifting - the player is already standing nearby after the fight.
-constexpr float RALIA_SPEECH_X = 75.0f;
-constexpr float RALIA_SPEECH_Y = -2125.0f;
-constexpr float RALIA_SPEECH_Z = -30.12f;
-constexpr float RALIA_SPEECH_O = 3.5f;
+// Last node of the escape path - the lip of the wall, right next to Captain
+// Garrick (156651, spawn 8001001 at 87 / -2246.5 / 94.48). Kept as constants
+// because the ride also finishes on proximity: node 23 is reached by a vertical
+// 6.6-yard climb up the cliff face, and a navigation hiccup there must not leave
+// the player stuck on her back with the quest unfinished.
+//
+// The proximity test carries a Z window as well. Node 22 - the foot of that same
+// wall - sits at the identical x/y, so a horizontal-only check would close the
+// ride the instant she arrived at the bottom of the climb and drop the player
+// inside the rock.
+constexpr float RALIA_END_X = 86.4066f;
+constexpr float RALIA_END_Y = -2244.46f;
+constexpr float RALIA_END_Z = 93.7894f;
+constexpr float RALIA_END_RADIUS = 8.0f;
+constexpr float RALIA_END_Z_WINDOW = 3.0f;
 
-// point id for the short walk off the altar to the speech mark
-constexpr uint32 RALIA_WALK_POINT = 0;
+// Where the player is put down once the ride closes: two yards in front of
+// Captain Garrick (156651, guid 8001001 at 87 / -2246.5 / 94.48, facing 1.5),
+// so the quest hand-in NPC is in plain sight the moment they land. Hard-coded
+// rather than derived from the creature: the creature may be missing from the
+// world, and the landing must not depend on it.
+constexpr float RALIA_LEDGE_X = 87.14f;
+constexpr float RALIA_LEDGE_Y = -2244.50f;
+constexpr float RALIA_LEDGE_Z = 93.92f;
 
-// How long she stays humanoid after dropping: matches creature_text group 1's
-// Duration, i.e. the shift lands right as her speech bubble clears.
-constexpr Milliseconds RALIA_SPEECH_LINE = 4s;
+// Where Garrick himself is put when the ride closes - his own spawn point two
+// yards behind the landing spot, but summoned at runtime rather than taken from
+// creature guid 8001001, which never renders on the client. Z is the spawn
+// row's 94.48; the walkable floor there is 94.148, so he simply settles.
+constexpr float GARRICK_LEDGE_X = 87.0f;
+constexpr float GARRICK_LEDGE_Y = -2246.5f;
+constexpr float GARRICK_LEDGE_Z = 94.48f;
+constexpr float GARRICK_LEDGE_O = 1.5f;
+
+// Captain Garrick, the npc the player reports back to at the mouth of the burrow.
+constexpr uint32 NPC_CAPTAIN_GARRICK_Q55639 = 156651;
+
+// Node 22, the foot of the wall. She has to get from here to node 23 by climbing
+// the face. If she is still standing here a few seconds later the waypoint
+// generator has given up on that leg (first attempt used a perfectly vertical
+// last leg - dx = dy = 0 - and the ride froze on the spot), so the ride pushes
+// her up with a direct move of its own instead of dead-ending the scene.
+constexpr float RALIA_WALL_FOOT_X = 84.6f;
+constexpr float RALIA_WALL_FOOT_Y = -2238.5f;
+constexpr float RALIA_WALL_FOOT_RADIUS = 3.0f;
+
+// Garrick is spawned in this phase. phase_area only hands it out while quest
+// 55639 is completed or rewarded (conditions: type 47, state mask 66), which is
+// circular - the ride is the objective that completes it. So the arrival grants
+// the phase explicitly, otherwise the player is dropped on an empty ledge.
+constexpr uint32 RALIA_QUEST_PHASE = 13816;
+
+// How long she stays on her line before the player is put on her back and she
+// starts running. creature_text.Duration is only the return value of
+// SendChat() for the server and is never sent to the client, so the client
+// sizes the bubble by itself - this beat is the only thing that can hold the
+// ride back until "You saved my life! Allow me to return the favor! Hop on!"
+// has actually been read.
+constexpr Milliseconds RALIA_SPEECH_LINE = 6s;
+
+// Click-to-ride is only meant to exist in stag form. It is toggled through
+// NpcFlags at runtime because creature_template.npcflag is per template, not
+// per form: the spawn carries both GOSSIP (right-click menu) and SPELLCLICK
+// (the client's "mount me" pointer, backed by npc_spellclick_spells 156929 ->
+// 46598 Ride Vehicle). With SPELLCLICK stripped while she is a night elf the
+// client has nothing to click, so the player is never sucked onto her back -
+// much cleaner than accepting the board and ejecting a moment later.
+constexpr NPCFlags RALIA_RIDE_NPC_FLAGS = static_cast<NPCFlags>(UNIT_NPC_FLAG_GOSSIP | UNIT_NPC_FLAG_SPELLCLICK);
+
+// While Hrun drains her, Ralia hangs over the platform. That is NOT done with
+// the hover movement flag any more - see ApplyCaptiveState() for why the
+// gravity flag is used instead. Her suspended height now comes from
+// creature.position_z alone (guid 8001000), roughly 2.4 yd above the platform
+// Hrun stands on.
+
+// Resolved once: 91010 is the model every other Ralia in the zone wears, 37729
+// is the fallback the client is guaranteed to carry.
+inline uint32 RaliaNightElfDisplayId()
+{
+    static uint32 resolved = 0;
+
+    if (!resolved)
+    {
+        if (sCreatureDisplayInfoStore.LookupEntry(DISPLAY_RALIA_NIGHTELF))
+            resolved = DISPLAY_RALIA_NIGHTELF;
+        else
+        {
+            resolved = DISPLAY_RALIA_FALLBACK;
+            TC_LOG_ERROR("server", "Ralia (156929): display {} is missing on this client, using {} for her night elf form.",
+                uint32(DISPLAY_RALIA_NIGHTELF), resolved);
+        }
+    }
+
+    return resolved;
+}
+
+// Puts the rider down on the ledge one beat after the vehicle exit.
+//
+// Why not teleport straight away: the "let go of her" instruction to the client
+// is the vehicle-exit spline that Unit::_ExitVehicle() queues at the highest
+// motion priority. Player::TeleportTo() cancels that spline (DisableSpline() +
+// InterruptOnTeleport()) in the same tick it is queued, so the client never
+// receives the exit and keeps rendering the rider sitting on a creature the
+// server has already released. Delaying the move by 800 ms lets the exit packet
+// out first; the teleport then rebuilds the movement state on top of it.
+class RaliaLedgeDrop : public BasicEvent
+{
+public:
+    explicit RaliaLedgeDrop(ObjectGuid playerGuid) : _playerGuid(playerGuid) { }
+
+    bool Execute(uint64, uint32) override
+    {
+        Player* player = ObjectAccessor::FindConnectedPlayer(_playerGuid);
+        if (!player)
+            return true;
+
+        bool stillAttached = !player->m_movementInfo.transport.guid.IsEmpty() || player->GetVehicle();
+
+        // anything the exit left behind has to be gone before the move, or the
+        // teleport ships the old transport block straight back to the client
+        player->m_movementInfo.transport.Reset();
+        player->m_movementInfo.ResetTransport();
+
+        TC_LOG_INFO("server", "Ralia (156929): placing {} on the ledge - still attached {}, at ({:.2f}, {:.2f}, {:.2f}).",
+            player->GetName(), stillAttached ? 1 : 0,
+            player->GetPositionX(), player->GetPositionY(), player->GetPositionZ());
+
+        player->TeleportTo(player->GetMapId(), RALIA_LEDGE_X, RALIA_LEDGE_Y, RALIA_LEDGE_Z, player->GetOrientation());
+        return true;
+    }
+
+private:
+    ObjectGuid _playerGuid;
+};
+
+// Which seat of her kit still holds this rider, or -1. Used by the teardown log
+// only: the seat table and m_vehicle can disagree, and that disagreement is the
+// whole reason the rider used to stay glued to her back.
+static int8 RaliaRiderSeat(Creature* ralia, Player* player)
+{
+    Vehicle* kit = ralia->GetVehicleKit();
+    if (!kit || !player)
+        return -1;
+
+    for (int8 seat = 0; seat < 8; ++seat)
+        if (kit->GetPassenger(seat) == player)
+            return seat;
+
+    return -1;
+}
+
+// Closes the ride using nothing but the creature and the rider. Deliberately a
+// free function: the AI that starts the ride has twice been found dead by the
+// time she reaches the last wall (no waypoint callbacks, no UpdateAI ticks at
+// all - only the motion generator kept running), and the scene still has to end
+// with the player standing on the ledge with the quest credited.
+void EndRaliaEscapeRide(Creature* ralia, Player* player)
+{
+    if (!ralia)
+        return;
+
+    TC_LOG_INFO("server", "Ralia (156929): escape finished at ({:.2f}, {:.2f}, {:.2f}), rider {}.",
+        ralia->GetPositionX(), ralia->GetPositionY(), ralia->GetPositionZ(),
+        player ? player->GetName() : "<none>");
+
+    TC_LOG_INFO("server", "Ralia (156929): teardown - rider {}, attached to vehicle {}, seat map {}.",
+        player ? player->GetName() : "<none>",
+        (player && player->GetVehicle()) ? 1 : 0,
+        ralia->GetVehicleKit() ? 1 : 0);
+
+    ralia->GetMotionMaster()->Clear();
+    ralia->StopMoving();
+
+    // Put the rider down. Four separate things go wrong here and every one of
+    // them has to be covered:
+    //  1. ExitVehicle() opens with `if (!m_vehicle) return;` and on the live
+    //     ride the server already considered the player detached ("attached to
+    //     vehicle 0" in the log) while the client kept rendering them sitting
+    //     on her back, so the call did nothing.
+    //  2. SPELL_AURA_CONTROL_VEHICLE sits on the *vehicle* with the rider as
+    //     its caster - HandleAuraControlVehicle() returns early unless the
+    //     aura's own target IsVehicle() - so clearing it from the player does
+    //     nothing. It has to come off her, keyed by the rider's guid.
+    //  3. Vehicle::GetPassenger() has come back empty on a live ride, so
+    //     walking the seats is not a reliable way to find the rider either.
+    //  4. The seat is CAN_CONTROL, so VehicleJoinEvent::Execute() put a
+    //     CHARM_TYPE_VEHICLE charm on the pair after it set m_vehicle. When the
+    //     control aura disappears before the exit runs, the vehicle release is
+    //     skipped and the rider stays charmed by her - and Player::
+    //     StopCastingCharm() cannot be used as the recovery here because it
+    //     ABORT()s the whole server on exactly this state. Undo the charm by
+    //     hand instead.
+    if (player)
+    {
+        TC_LOG_INFO("server", "Ralia (156929): teardown state - vehicle {}, charmed {}, charmer {}, seat {}, transport {}, control auras ralia {} / player {}.",
+            player->GetVehicle() ? 1 : 0,
+            player->GetCharmed() ? 1 : 0,
+            ralia->GetCharmerGUID().ToString(),
+            int32(RaliaRiderSeat(ralia, player)),
+            player->m_movementInfo.transport.guid.IsEmpty() ? 0 : 1,
+            uint32(ralia->HasAuraType(SPELL_AURA_CONTROL_VEHICLE) ? 1 : 0),
+            uint32(player->HasAuraType(SPELL_AURA_CONTROL_VEHICLE) ? 1 : 0));
+
+        // 1) her side first: removing this aura is what triggers _ExitVehicle()
+        ralia->RemoveAurasByType(SPELL_AURA_CONTROL_VEHICLE, player->GetGUID());
+
+        // 2) the sanctioned way out, for the case where m_vehicle is still set
+        if (player->GetVehicle())
+            player->ExitVehicle();
+
+        // 3) the charm the join event left behind
+        if (Unit* charmed = player->GetCharmed())
+        {
+            player->SetClientControl(charmed, false);
+            player->SetClientControl(player, true);
+            player->SetCharm(charmed, false);
+            charmed->RemoveUnitFlag(UNIT_FLAG_POSSESSED);
+            charmed->RemoveCharmAuras();
+        }
+
+        // 4) rider-side leftovers
+        player->RemoveAurasByType(SPELL_AURA_CONTROL_VEHICLE);
+
+        // The riding pose is driven by the movement info's transport reference,
+        // NOT by m_vehicle. With m_vehicle already null nothing in the teardown
+        // clears it, so the player keeps sitting on thin air while the server
+        // believes they are standing on the ground. Reset the transport here so
+        // the delayed drop below ships a transport-free movement block.
+        player->m_movementInfo.transport.Reset();
+        player->m_movementInfo.ResetTransport();
+    }
+
+    if (Vehicle* kit = ralia->GetVehicleKit())
+    {
+        for (int8 seat = 0; seat < 8; ++seat)
+        {
+            Unit* passenger = kit->GetPassenger(seat);
+            if (!passenger)
+                continue;
+
+            if (passenger->IsPlayer())
+                passenger->ToPlayer()->SetImmuneToNPC(false);
+
+            passenger->ExitVehicle();
+        }
+
+        // last resort: anything still attached to her must not stay there, or
+        // she despawns two minutes later with a rider tied to a dead seat.
+        // No-op when every passenger already left.
+        kit->RemoveAllPassengers();
+    }
+
+    // The ride is over, so neither of them stays untouchable: she is a normal
+    // quest NPC again and the player has to be attackable by NPCs like before.
+    ralia->SetImmuneToNPC(false);
+    ralia->SetReactState(REACT_AGGRESSIVE);
+
+    if (player)
+        player->SetImmuneToNPC(false);
+
+    // A vehicle keeps its base model while a passenger is still on it, so the
+    // shift back has to happen strictly after ExitVehicle().
+    ralia->SetObjectScale(1.0f);
+    ralia->SetDisplayId(RaliaNightElfDisplayId());
+
+    // back in night elf form: nothing to click any more
+    ralia->RemoveNpcFlag(RALIA_RIDE_NPC_FLAGS);
+
+    // nothing of the captive suspend should survive onto the ledge
+    ralia->SetControlled(false, UNIT_STATE_ROOT);
+    ralia->SetDisableGravity(false);
+
+    if (player)
+    {
+        // No explicit phasing here, and this is important: phasing is a
+        // whitelist. The moment the player owns a phase they stop seeing
+        // everything that owns none, so handing them 13816 here hid Garrick
+        // (PhaseId 0 + always-visible) instead of revealing him. He now carries
+        // PHASE_USE_FLAGS_ALWAYS_VISIBLE on his own spawn row, which ignores
+        // phasing entirely - see fix_garrick_phase_156651.sql.
+
+        // Hand the player a real move, but not in this tick: the exit spline
+        // that tells the client to stop sitting on her is queued at the highest
+        // motion priority, and TeleportTo() cancels it (DisableSpline() +
+        // InterruptOnTeleport()) before it ever goes out. That is precisely the
+        // "server says dismounted, client keeps sitting" state we kept hitting,
+        // so the drop waits ~0.8 s in RaliaLedgeDrop.
+        if (ralia->GetPositionZ() < RALIA_END_Z - 3.0f)
+            TC_LOG_ERROR("server", "Ralia (156929): ride closed {:.1f} yd below the exit - moving the player to the ledge.",
+                RALIA_END_Z - ralia->GetPositionZ());
+
+        player->m_Events.AddEventAtOffset(new RaliaLedgeDrop(player->GetGUID()), 800ms);
+
+        // Garrick is the static spawn guid 8001001 on the ledge - and he now
+        // actually renders. The reason he never did was neither the model nor
+        // the phase: world.conditions holds two OBJECT_ID_VISIBILITY rows
+        // (SourceTypeOrReferenceId 32, SourceGroup 5 = TYPEID_UNIT in this
+        // core) for entry 156651 and BOTH must pass before the creature is ever
+        // sent to a client. One of them only allowed quest 55173 "Northbound"
+        // to be untaken, so every player who had already finished it - which is
+        // everyone on this quest chain - got him filtered out by
+        // CanSeeOrDetect() long before display or phasing mattered. See
+        // fix_garrick_visibility_condition_156651.sql (mask 1 -> 65).
+        //
+        // The summon below is a safety net only: it fires when the spawn is not
+        // in the world at all (grid not loaded, row deleted), never to stand in
+        // for a spawn that exists.
+        if (!player->FindNearestCreature(NPC_CAPTAIN_GARRICK_Q55639, 60.0f))
+        {
+            if (Creature* garrick = ralia->SummonCreature(NPC_CAPTAIN_GARRICK_Q55639,
+                    GARRICK_LEDGE_X, GARRICK_LEDGE_Y, GARRICK_LEDGE_Z, GARRICK_LEDGE_O,
+                    TEMPSUMMON_TIMED_OR_DEAD_DESPAWN, 1h))
+            {
+                PhasingHandler::InheritPhaseShift(garrick, player);
+                garrick->UpdateObjectVisibility();
+                garrick->SetFacingToObject(player);
+
+                TC_LOG_INFO("server", "Ralia (156929): no Garrick within 60 yd - summoned a stand-in at ({:.2f}, {:.2f}, {:.2f}), display {}.",
+                    garrick->GetPositionX(), garrick->GetPositionY(), garrick->GetPositionZ(),
+                    garrick->GetDisplayId());
+            }
+            else
+                TC_LOG_ERROR("server", "Ralia (156929): no Garrick within 60 yd and the stand-in could not be summoned.");
+        }
+
+        // Put her down with the player instead of leaving her wherever the last
+        // waypoint happened to be, so the two of them end the scene together.
+        float x = player->GetPositionX() + std::cos(player->GetOrientation()) * 1.8f;
+        float y = player->GetPositionY() + std::sin(player->GetOrientation()) * 1.8f;
+        ralia->NearTeleportTo(x, y, player->GetPositionZ(), ralia->GetOrientation());
+        ralia->SetFacingToObject(player);
+
+        // objective 393740 "Ride Ralia Dreamchaser to escape"
+        player->KilledMonsterCredit(NPC_RALIA_DREAMCHASER_Q55639);
+    }
+
+    sCreatureTextMgr->SendChat(ralia, TEXT_RALIA_OUT, player, CHAT_MSG_MONSTER_SAY, LANG_UNIVERSAL);
+
+    // Long enough for the player to actually see her back in night elf form;
+    // the respawn delay still governs when she returns to the pit.
+    ralia->DespawnOrUnsummon(2min, Seconds(ralia->GetRespawnDelay()));
+}
+
+// Forward declaration: defined after the AI struct, because the watchdog has to
+// know the concrete AI type to reset its ride state when it closes the scene.
+void StartRaliaRideWatchdog(Creature* ralia);
 
 // 156929 - Ralia Dreamchaser
 //
@@ -7225,12 +7565,26 @@ struct npc_ralia_dreamchaser_q55639 : public ScriptedAI
 
     void Reset() override
     {
+        // an AI re-init in the middle of the ride would silently wipe the ride
+        // state while she keeps running on the motion generator, so say so
+        if (_escaping)
+            TC_LOG_ERROR("server", "Ralia (156929): AI reset in the middle of the escape at ({:.2f}, {:.2f}, {:.2f}) - ride state dropped.",
+                me->GetPositionX(), me->GetPositionY(), me->GetPositionZ());
+
         _events.Reset();
         _escaping = false;
         _saidHelp = false;
-        _speechStarted = false;
+        _finishRequested = false;
+        _rideArmed = false;
+        _stuckMs = 0;
+        _heartbeatMs = 0;
         _escapeeGUID.Clear();
         _ejectGUID.Clear();
+
+        // an evade or respawn in the middle of the scene must not leave the
+        // no-combat state from the ride stuck on her
+        me->SetImmuneToNPC(false);
+        me->SetReactState(REACT_AGGRESSIVE);
     }
 
     void JustAppeared() override
@@ -7254,8 +7608,8 @@ struct npc_ralia_dreamchaser_q55639 : public ScriptedAI
             return false;
 
         // She is only rideable as the stag. While the ritual holds her she is a
-        // captive on the altar, and during the freed beat she is still a night
-        // elf saying her line - neither may be mounted.
+        // captive hanging over the altar, and during the freed beat she is still
+        // a night elf saying her line - neither may be mounted, so no menu.
         if (me->GetDisplayId() != DISPLAY_RALIA_STAG)
             return false;
 
@@ -7298,50 +7652,58 @@ struct npc_ralia_dreamchaser_q55639 : public ScriptedAI
         SpawnRitualBraziers();
 
         // Step 3 starts here: the burrow comes down the moment he drops, so the
-        // pit is already burning while the player climbs on. Flames are placed
-        // from the altar before she moves, so they stay in the pit behind her
-        // instead of popping up under the player's feet.
+        // pit is already burning while the player climbs on.
         for (uint32 i = 0; i < 6; ++i)
             SpawnFireAt(frand(0.0f, RALIA_TWO_PI), frand(3.0f, 10.0f));
 
-        // Freed, on her feet, still a night elf: she walks off the altar to the
-        // spot the scene puts her on. Walking (not teleporting) so the drop and
-        // the step over read as one motion; the speech starts on arrival.
-        me->GetMotionMaster()->Clear();
-        me->GetMotionMaster()->MovePoint(RALIA_WALK_POINT, RALIA_SPEECH_X, RALIA_SPEECH_Y, RALIA_SPEECH_Z,
-            true, RALIA_SPEECH_O, {}, MovementWalkRunSpeedSelectionMode::ForceWalk);
+        Player* escapee = me->SelectNearestPlayer(50.0f);
+        if (!escapee || escapee->GetQuestStatus(QUEST_WHO_LURKS_IN_THE_PIT) != QUEST_STATUS_INCOMPLETE)
+            return;
 
-        // if the point move is refused (navmesh gap under the platform) she
-        // would stand there silently forever, so fall back to the exact spot
-        _events.ScheduleEvent(EVENT_RALIA_WALK_GUARD, 10s);
+        _escapeeGUID = escapee->GetGUID();
 
-        // A nearby player who still needs the objective gets auto-boarded once
-        // she has shifted; without one she still shifts and waits to be clicked.
-        if (Player* escapee = me->SelectNearestPlayer(50.0f))
-            if (escapee->GetQuestStatus(QUEST_WHO_LURKS_IN_THE_PIT) == QUEST_STATUS_INCOMPLETE)
-                _escapeeGUID = escapee->GetGUID();
-
-        // the line and the shift are started by StartSpeech(), on arrival
-    }
-
-    void MovementInform(uint32 type, uint32 pointId) override
-    {
-        if (type == POINT_MOTION_TYPE && pointId == RALIA_WALK_POINT)
-            StartSpeech();
+        // hold the humanoid form until she has actually landed, so the order
+        // reads on screen: freed in night elf form -> she drops -> she shifts ->
+        // the player is put on her. The fall is ~2.4 yd, about 0.7 s, so 1.2 s
+        // leaves her standing on the altar before the stag appears.
+        _events.ScheduleEvent(EVENT_RALIA_SHIFT, 1200ms);
     }
 
     void PassengerBoarded(Unit* passenger, int8 seatId, bool apply) override
     {
-        if (!apply || seatId != 0 || !passenger->IsPlayer())
+        if (seatId != 0 || !passenger->IsPlayer())
             return;
 
         Player* player = passenger->ToPlayer();
 
-        // She is a vehicle the whole time, so a click lands even while the
-        // ritual still holds her. Only the stag is rideable: anything else is
-        // put straight back off, with no state change at all - if Hrun is still
-        // alive she simply stays captive, exactly as she was.
-        if (me->GetDisplayId() != DISPLAY_RALIA_STAG)
+        // Leaving the vehicle for any reason - end of the run, a jump-off, or a
+        // refused ride - has to hand the rider's normal targetability back,
+        // otherwise the escape would leave them immune to every NPC afterwards.
+        if (!apply)
+        {
+            // The rider leaving on their own is the one path that needs no
+            // help from EndRaliaEscapeRide(), so log which of the two it was -
+            // it is the difference between "the exit ran" and "the aura
+            // vanished and the exit never happened".
+            TC_LOG_INFO("server", "Ralia (156929): rider {} left seat {} - vehicle now {}, transport {}.",
+                player->GetName(), int32(seatId),
+                player->GetVehicle() ? 1 : 0,
+                player->m_movementInfo.transport.guid.IsEmpty() ? 0 : 1);
+
+            player->SetImmuneToNPC(false);
+            return;
+        }
+
+        // She is a vehicle the whole time, so spellclick lands even while the
+        // ritual still holds her. The ride only exists in stag form, and only
+        // once the "Defeat Hrun" objective is ticked - otherwise a player could
+        // mount her and skip the fight. A refused ride changes none of her
+        // state: she is put straight back down exactly as she was.
+        bool rideable = me->GetDisplayId() == DISPLAY_RALIA_STAG;
+
+        if (!rideable ||
+            (!_escaping &&
+                player->GetQuestObjectiveData(QUEST_WHO_LURKS_IN_THE_PIT, OBJECTIVE_DEFEAT_HRUN) <= 0))
         {
             _ejectGUID = player->GetGUID();
             _events.ScheduleEvent(EVENT_RALIA_EJECT, 200ms);
@@ -7353,13 +7715,50 @@ struct npc_ralia_dreamchaser_q55639 : public ScriptedAI
         // NOT credited here: the quest wants the player actually carried out of
         // the pit, so it is credited on arrival in FinishEscape().
         _escaping = true;
+
+        // Also covers the gossip path, where DoAction() never ran and this is
+        // the only place the rider's guid gets recorded. Everything downstream
+        // (FinishEscape, ForceCloseRide) falls back to it when the seat map
+        // cannot produce the passenger.
+        _escapeeGUID = player->GetGUID();
+
         StartRide();
     }
 
     void WaypointReached(uint32 nodeId, uint32 pathId) override
     {
-        if (pathId != RALIA_ESCAPE_PATH || nodeId != RALIA_ESCAPE_LAST_NODE)
+        if (pathId != RALIA_ESCAPE_PATH)
             return;
+
+        // the last three nodes are the only ones that ever misbehaved; log them
+        // so a ride that dies on the final climb says exactly where it died
+        if (nodeId >= 20)
+            TC_LOG_INFO("server", "Ralia (156929): reached waypoint {} at ({:.2f}, {:.2f}, {:.2f}).",
+                nodeId, me->GetPositionX(), me->GetPositionY(), me->GetPositionZ());
+
+        // she is at the foot of the last wall: start the watchdog that pushes her
+        // up the face if the waypoint generator refuses the climb
+        if (nodeId == RALIA_ESCAPE_LAST_NODE - 1)
+            _events.ScheduleEvent(EVENT_RALIA_CLIMB_FALLBACK, 3000ms);
+
+        if (nodeId != RALIA_ESCAPE_LAST_NODE)
+            return;
+
+        TC_LOG_INFO("server", "Ralia (156929): reached the last waypoint ({}), closing the ride.",
+            RALIA_ESCAPE_LAST_NODE);
+
+        RequestFinish();
+    }
+
+    // Both the last waypoint and the proximity check land here, so a navigation
+    // failure on the final climb still ends the scene instead of leaving the
+    // player riding her forever.
+    void RequestFinish()
+    {
+        if (_finishRequested)
+            return;
+
+        _finishRequested = true;
 
         _events.CancelEvent(EVENT_RALIA_TIMEOUT);
         _events.CancelEvent(EVENT_RALIA_FIRE);
@@ -7370,9 +7769,101 @@ struct npc_ralia_dreamchaser_q55639 : public ScriptedAI
         _events.ScheduleEvent(EVENT_RALIA_FINISH, 50ms);
     }
 
+    // Last line of defence for the ride. Everything above this depends on
+    // something that has already failed at least once: the last waypoint
+    // callback never fired, the spline stopped yards off the node, and the
+    // distance test needs the server to know she is near the exit at all. This
+    // only needs her to stand still for five seconds, which no healthy ride
+    // does, and it ends the scene at the ledge either way.
+    void WatchRideProgress(uint32 diff)
+    {
+        float x = me->GetPositionX();
+        float y = me->GetPositionY();
+        float z = me->GetPositionZ();
+
+        // heartbeat: tells "is the script ticking at all" from "the script ticks
+        // but the ride is lost", which look identical from in game
+        _heartbeatMs += diff;
+        if (_heartbeatMs >= 3000)
+        {
+            _heartbeatMs = 0;
+
+            auto [waypointId, pathId] = me->GetCurrentWaypointInfo();
+            TC_LOG_INFO("server", "Ralia (156929) ride: ({:.2f}, {:.2f}, {:.2f}), armed={}, spline done={}, waypoint {}/{}.",
+                x, y, z, _rideArmed ? 1 : 0, me->movespline->Finalized() ? 1 : 0, waypointId, pathId);
+        }
+
+        if (!_rideArmed)
+            return;
+
+        float moved = me->GetDistance(_lastRideX, _lastRideY, _lastRideZ);
+        if (moved > 1.0f)
+        {
+            _lastRideX = x;
+            _lastRideY = y;
+            _lastRideZ = z;
+            _stuckMs = 0;
+            return;
+        }
+
+        _stuckMs += diff;
+        if (_stuckMs < 5000)
+            return;
+
+        TC_LOG_ERROR("server", "Ralia (156929): ride stalled for 5 s at ({:.2f}, {:.2f}, {:.2f}) - closing the scene.",
+            x, y, z);
+
+        RequestFinish();
+    }
+
     void UpdateAI(uint32 diff) override
     {
         _events.Update(diff);
+
+        // Probe: is this AI being ticked at all while somebody is on her back?
+        // Every failure of this scene so far has boiled down to that question,
+        // and from in game "the AI is dead" and "the AI is alive but its ride
+        // state was wiped" look exactly the same.
+        if (Vehicle* probeKit = me->GetVehicleKit())
+        {
+            if (probeKit->GetPassenger(0))
+            {
+                _tickProbeMs += diff;
+                if (_tickProbeMs >= 5000)
+                {
+                    _tickProbeMs = 0;
+                    TC_LOG_INFO("server", "Ralia (156929) tick: ({:.2f}, {:.2f}, {:.2f}), escaping={}, finishPending={}, armed={}.",
+                        me->GetPositionX(), me->GetPositionY(), me->GetPositionZ(),
+                        _escaping ? 1 : 0, _finishRequested ? 1 : 0, _rideArmed ? 1 : 0);
+                }
+            }
+            else
+                _tickProbeMs = 0;
+        }
+
+        if (_escaping && !_finishRequested)
+            WatchRideProgress(diff);
+
+        // Node 23 is a vertical climb up the last wall. If the spline refuses it
+        // the generator simply stops, and without this the player would sit on
+        // her back forever with the quest still open - which is exactly what
+        // happened before. Finish on horizontal + vertical proximity too, so the
+        // ride always closes out even if that final climb is cut short.
+        if (_escaping && !_finishRequested)
+        {
+            float dx = me->GetPositionX() - RALIA_END_X;
+            float dy = me->GetPositionY() - RALIA_END_Y;
+            float dz = me->GetPositionZ() - RALIA_END_Z;
+
+            if (dx * dx + dy * dy <= RALIA_END_RADIUS * RALIA_END_RADIUS &&
+                std::fabs(dz) <= RALIA_END_Z_WINDOW)
+            {
+                TC_LOG_INFO("server", "Ralia (156929): within {:.1f} yd of the exit at ({:.2f}, {:.2f}, {:.2f}), closing the ride.",
+                    RALIA_END_RADIUS, me->GetPositionX(), me->GetPositionY(), me->GetPositionZ());
+
+                RequestFinish();
+            }
+        }
 
         while (uint32 eventId = _events.ExecuteEvent())
         {
@@ -7386,12 +7877,13 @@ struct npc_ralia_dreamchaser_q55639 : public ScriptedAI
                         break;
 
                     // Step 2, second half: she is a druid, this is the shift
-                    // from the freed night elf into the stag. The line was
-                    // already said in humanoid form, so nothing is spoken here.
+                    // from the freed night elf into the stag.
                     TransformIntoStag();
+                    sCreatureTextMgr->SendChat(me, TEXT_RALIA_SAVED, nullptr, CHAT_MSG_MONSTER_SAY, LANG_UNIVERSAL);
 
-                    // Step 3: the player is put on her, no click needed.
-                    _events.ScheduleEvent(EVENT_RALIA_BOARD, 2s);
+                    // Step 3: the player is put on her, no click needed - but
+                    // only after she has finished talking.
+                    _events.ScheduleEvent(EVENT_RALIA_BOARD, RALIA_SPEECH_LINE);
                     break;
                 }
                 case EVENT_RALIA_BOARD:
@@ -7416,13 +7908,13 @@ struct npc_ralia_dreamchaser_q55639 : public ScriptedAI
                     _events.ScheduleEvent(EVENT_RALIA_FIRE, 700ms);
                     break;
                 }
-                case EVENT_RALIA_SHAKE:
-                {
-                    // the whole burrow is coming down, not just the floor
-                    ShakeRiderCamera();
-                    _events.ScheduleEvent(EVENT_RALIA_SHAKE, 1500ms);
-                    break;
-                }
+                // EVENT_RALIA_SHAKE is deliberately not handled any more. The
+                // shake was the only screen-wide effect the ride applied
+                // (spell 248719, repeated every 1.5 s for the whole run), and
+                // it is what pulls the client into its cinematic state: the
+                // player gets letterbox bars above and below the screen for
+                // the entire ride. The collapse is still sold by the flames
+                // and the falling rock, so the camera shake is simply gone.
                 case EVENT_RALIA_LINE_SPIDERS:
                 {
                     sCreatureTextMgr->SendChat(me, TEXT_RALIA_SMALL_SPIDERS, nullptr, CHAT_MSG_MONSTER_SAY, LANG_UNIVERSAL);
@@ -7438,14 +7930,40 @@ struct npc_ralia_dreamchaser_q55639 : public ScriptedAI
                     if (!_escaping)
                         break;
 
-                    // may be empty if the player jumped off on the way up; the
-                    // scene still has to be closed out so she does not stay a
-                    // stag standing on the ledge
-                    Unit* rider = nullptr;
-                    if (Vehicle* kit = me->GetVehicleKit())
-                        rider = kit->GetPassenger(0);
+                    // The rider may be unreachable through the seat map even
+                    // though they are still on her back, so let FinishEscape()
+                    // resolve them (seat map -> scene guid -> nearest player).
+                    // Without a rider the scene still closes out, so she does
+                    // not stay a stag standing on the ledge.
+                    FinishEscape(nullptr);
+                    break;
+                }
+                case EVENT_RALIA_ARM_RIDE:
+                {
+                    _rideArmed = true;
+                    _stuckMs = 0;
+                    _lastRideX = me->GetPositionX();
+                    _lastRideY = me->GetPositionY();
+                    _lastRideZ = me->GetPositionZ();
+                    break;
+                }
+                case EVENT_RALIA_CLIMB_FALLBACK:
+                {
+                    if (!_escaping || _finishRequested)
+                        break;
 
-                    FinishEscape(rider);
+                    float dx = me->GetPositionX() - RALIA_WALL_FOOT_X;
+                    float dy = me->GetPositionY() - RALIA_WALL_FOOT_Y;
+
+                    // still parked at the foot of the wall -> the waypoint
+                    // generator is not taking her up, so drive the last leg here
+                    if (dx * dx + dy * dy > RALIA_WALL_FOOT_RADIUS * RALIA_WALL_FOOT_RADIUS)
+                        break;
+
+                    TC_LOG_ERROR("server", "Ralia (156929): stuck at the foot of the wall ({:.2f}, {:.2f}, {:.2f}) - pushing her up it manually.",
+                        me->GetPositionX(), me->GetPositionY(), me->GetPositionZ());
+
+                    me->GetMotionMaster()->MovePoint(0, Position(RALIA_END_X, RALIA_END_Y, RALIA_END_Z, 0.0f), false, {}, RALIA_RIDE_SPEED);
                     break;
                 }
                 case EVENT_RALIA_TIMEOUT:
@@ -7456,35 +7974,22 @@ struct npc_ralia_dreamchaser_q55639 : public ScriptedAI
                     _events.CancelEvent(EVENT_RALIA_FIRE);
                     _events.CancelEvent(EVENT_RALIA_SHAKE);
 
-                    Unit* rider = nullptr;
-                    if (Vehicle* kit = me->GetVehicleKit())
-                        rider = kit->GetPassenger(0);
-
-                    FinishEscape(rider);
+                    FinishEscape(nullptr);
                     break;
                 }
                 case EVENT_RALIA_EJECT:
                 {
                     // deferred so we never call ExitVehicle() from inside the
-                    // AddPassenger() callback that raised PassengerBoarded().
-                    // Nothing else is touched: a refused ride changes no state,
-                    // so she is already exactly as she was.
+                    // AddPassenger() callback that raised PassengerBoarded()
                     if (Player* player = ObjectAccessor::GetPlayer(*me, _ejectGUID))
                         player->ExitVehicle();
 
                     _ejectGUID.Clear();
-                    break;
-                }
-                case EVENT_RALIA_WALK_GUARD:
-                {
-                    // the point move never reported arrival - snap her onto the
-                    // mark and carry on, so the scene cannot stall here
-                    TC_LOG_ERROR("server", "Ralia (156929): walk to the speech mark timed out at ({:.2f}, {:.2f}, {:.2f}), snapping.",
-                        me->GetPositionX(), me->GetPositionY(), me->GetPositionZ());
 
-                    me->GetMotionMaster()->Clear();
-                    me->StopMoving();
-                    StartSpeech();
+                    // A refused ride must leave her exactly as she was: still
+                    // hanging over the altar in night elf form. Without this a
+                    // stray click left her stuck as a stag on the floor.
+                    RestoreCaptiveForm();
                     break;
                 }
                 case EVENT_RALIA_HELP_CHECK:
@@ -7519,74 +8024,35 @@ private:
             flame->SetObjectScale(frand(0.6f, 1.5f));
     }
 
+    // The pit already has two bare braziers standing either side of the altar;
+    // the scene only has to light them, so nothing is summoned except the fire
+    // itself. Positions are the real prop anchors read in game - a floor probe
+    // here comes back with the pit floor about 2.5 yd below the bowls and would
+    // bury the flames in the rock.
     void SpawnRitualBraziers()
     {
-        // Hrun's corpse marks the altar and is the only reliable floor
-        // reference here: Ralia hovers three yards up until the ritual breaks,
-        // so her Z would put both braziers into the ceiling probe's tolerance.
-        // alive = false, because he is a corpse by the time this runs.
-        Creature* hrun = me->FindNearestCreature(NPC_HRUN_THE_EXILED_Q55639, 60.0f, false);
-
-        float baseX = hrun ? hrun->GetPositionX() : me->GetPositionX();
-        float baseY = hrun ? hrun->GetPositionY() : me->GetPositionY();
-        float baseZ = hrun ? hrun->GetPositionZ() : me->GetPositionZ();
-
-        // offset perpendicular to the altar -> captive line, so the pair sits to
-        // the left and right of the ritual instead of in front of it
-        float dx = me->GetPositionX() - baseX;
-        float dy = me->GetPositionY() - baseY;
-
-        float len = std::sqrt(dx * dx + dy * dy);
-        if (len < 0.1f)
+        static Position const RitualFirePositions[] =
         {
-            dx = 1.0f;
-            dy = 0.0f;
-            len = 1.0f;
-        }
-
-        dx /= len;
-        dy /= len;
-
-        // left-hand normal of the altar -> captive direction
-        float px = -dy;
-        float py = dx;
+            { 75.475624f, -2118.487793f, -27.793022f, 4.999099f },   // left of the altar
+            { 63.658173f, -2124.810303f, -27.700300f, 5.251594f }    // right of the altar
+        };
 
         uint32 spawned = 0;
 
-        for (uint32 i = 0; i < 2; ++i)
+        for (Position const& pos : RitualFirePositions)
         {
-            float side = i == 0 ? 1.0f : -1.0f;
-            float x = baseX + px * 3.2f * side;
-            float y = baseY + py * 3.2f * side;
-
-            // The pit floor is narrow: if the probe comes back with a wildly
-            // different height the spot is inside a wall, so skip that side
-            // rather than burying a brazier in the rock.
-            float z = me->GetMapHeight(x, y, baseZ + 2.0f, true, 10.0f);
-            if (z < -100000.0f || std::fabs(z - baseZ) > 2.5f)
-                continue;
-
-            float ang = frand(0.0f, RALIA_TWO_PI);
-
-            me->SummonGameObject(GO_RITUAL_BRAZIER, x, y, z, ang, QuaternionData(), Seconds(GO_RITUAL_BRAZIER_LIFETIME));
-
-            // the brazier prop itself is a spellcaster type that only fires off
-            // its own spell every 8 s, so stack a small flame emitter on the
-            // bowl to guarantee a visible fire
-            if (GameObject* flame = me->SummonGameObject(GO_FLAME_EMITTER, x, y, z + 0.9f, ang, QuaternionData(), Seconds(GO_RITUAL_BRAZIER_LIFETIME)))
-                flame->SetObjectScale(0.35f);
-
-            ++spawned;
+            if (me->SummonGameObject(GO_FLAME_EMITTER, pos.GetPositionX(), pos.GetPositionY(),
+                    pos.GetPositionZ(), pos.GetOrientation(), QuaternionData(), Seconds(GO_RITUAL_FIRE_LIFETIME)))
+                ++spawned;
         }
 
-        TC_LOG_INFO("server", "Ralia (156929): lit {} ritual brazier(s) around ({:.2f}, {:.2f}).",
-            spawned, me->GetPositionX(), me->GetPositionY());
+        TC_LOG_INFO("server", "Ralia (156929): lit {} ritual flame(s).", spawned);
     }
 
-    // 73350 is the retail display id for her night elf form. If this client's
-    // CreatureDisplayInfo does not carry it, SetDisplayId() changes nothing on
-    // the client and she keeps whatever model it already had loaded (the stag),
-    // which is why she never turned back into an elf. Resolve it once.
+    // Her night elf form is 91010 (radius 0.306). Resolved at runtime because
+    // the client only honours SetDisplayId() when its CreatureDisplayInfo
+    // actually carries the id - otherwise the model keeps whatever it already
+    // had loaded, which is how she used to stay a stag after the escape.
     uint32 NightElfDisplay() const
     {
         static uint32 resolved = 0;
@@ -7620,6 +8086,11 @@ private:
             me->SetDisplayId(elfDisplay);
         }
 
+        // She spawns as a night elf, i.e. not rideable, so the click-to-ride
+        // interaction is locked off here; TransformIntoStag() is the only place
+        // that hands it back, and FinishEscape() takes it away again.
+        me->RemoveNpcFlag(RALIA_RIDE_NPC_FLAGS);
+
         // Hrun is only five yards away and stands on the pit floor; if he is
         // gone the ritual is over and she stays on her feet.
         Creature* hrun = me->FindNearestCreature(NPC_HRUN_THE_EXILED_Q55639, 100.0f, true);
@@ -7638,58 +8109,88 @@ private:
         // She hangs over the altar in her night elf form. The shift into a stag
         // is what she does *after* he dies, to carry the player out - it is not
         // her state while the ritual holds her.
-        if (me->IsHovering())
+        if (me->IsGravityDisabled())
             return;
 
-        // No floor probe here: she hangs over the ritual platform, and the
-        // spawn row already carries the correct base Z (fixed in
-        // fix_ralia_spawn_z.sql). Snapping to GetMapHeight() would pull her
-        // onto the pit floor below the platform, so the hover is applied on
-        // top of the stored Z as-is.
+        // Suspend her the way npc_briarpatch_prisoner (154301) suspends the
+        // ritual prisoners, not with SetHover().
+        //
+        // SetHover(true) sets MOVEMENTFLAG_HOVER, and the client animates a
+        // hovering unit with a vertical float of its own. On someone who is
+        // supposed to hang dead still that reads as her bobbing up and down,
+        // and the ritual rune bound to her model rocks along with it. Hover also
+        // fires SetAnimTier(AnimTier::Hover) and SetPlayHoverAnim(true) as two
+        // one-shot packets that are never re-sent, which is exactly why the
+        // bobbing stopped after leaving the scene's cinematic.
+        //
+        // DISABLE_GRAVITY keeps her off the floor with none of that attached:
+        // no hover movement flag, no hover animation state, so the client just
+        // leaves the model standing still in mid-air. Both update flags are
+        // passed as false - only the "ignore gravity" part is wanted, and the
+        // tier must not be flipped to Fly nor the hover anim flag raised.
+        //
+        // No floor probe either: her spawn row already carries the suspended Z
+        // (2.4 yd above the platform), and GetMapHeight() would pull her down
+        // onto the platform below.
         me->SetFacingToObject(hrun);
-        me->SetHoverHeight(RALIA_CAPTIVE_HOVER);
-        me->SetHover(true);
+        me->SetDisableGravity(true, /*updateAnimTier=*/false, /*updatePlayHoverAnim=*/false);
+        me->SetControlled(true, UNIT_STATE_ROOT);
 
-        TC_LOG_INFO("server", "Ralia (156929): held in night elf form, suspended {:.1f} yd above the floor at ({:.2f}, {:.2f}, {:.2f}).",
-            RALIA_CAPTIVE_HOVER, me->GetPositionX(), me->GetPositionY(), me->GetPositionZ());
+        TC_LOG_INFO("server", "Ralia (156929): held in night elf form, gravity disabled at ({:.2f}, {:.2f}, {:.2f}).",
+            me->GetPositionX(), me->GetPositionY(), me->GetPositionZ());
+    }
+
+    // Undo whatever a refused ride may have changed. Until Hrun dies she is a
+    // night elf hanging over the altar - any path that shifts her or drops her
+    // to the floor without an actual escape has to put that back.
+    void RestoreCaptiveForm()
+    {
+        if (_escaping)
+            return;
+
+        uint32 elfDisplay = NightElfDisplay();
+        if (me->GetDisplayId() != elfDisplay)
+        {
+            me->SetObjectScale(1.0f);
+            me->SetDisplayId(elfDisplay);
+        }
+
+        // back in night elf form, so also back to not being clickable
+        me->RemoveNpcFlag(RALIA_RIDE_NPC_FLAGS);
+
+        if (!me->IsGravityDisabled())
+        {
+            me->SetDisableGravity(true, /*updateAnimTier=*/false, /*updatePlayHoverAnim=*/false);
+            me->SetControlled(true, UNIT_STATE_ROOT);
+        }
+
+        // a refused ride has to leave her exactly as the ritual holds her,
+        // purple rune included
+        if (!me->HasAura(SPELL_RALIA_NECROTIC_RITUAL))
+            me->AddAura(SPELL_RALIA_NECROTIC_RITUAL, me);
     }
 
     void ReleaseFromCaptiveState()
     {
         // the ritual dies with Hrun: the purple goes with it, whether or not
-        // she is still hovering at this point
+        // she is still suspended at this point
         me->RemoveAura(SPELL_RALIA_NECROTIC_RITUAL);
 
-        if (!me->IsHovering())
+        if (!me->IsGravityDisabled())
             return;
 
-        // SetHover(false) walks her back down to the floor by HoverHeight
-        me->SetHover(false);
-        me->SetHoverHeight(0.0f);
-    }
+        // Gravity back on and no longer rooted, then let her drop onto the
+        // platform for real instead of teleporting - the drop is part of the
+        // scene. SetDisableGravity(false) also restores the ground anim tier
+        // and clears the hover anim flag, so nothing of the suspend is left.
+        me->SetControlled(false, UNIT_STATE_ROOT);
+        me->SetDisableGravity(false);
 
-    // She has finished the walk: say the line in humanoid form, then shift as
-    // the bubble clears. Called from MovementInform() and from the walk guard,
-    // so it has to be safe to run twice.
-    void StartSpeech()
-    {
-        if (_speechStarted)
-            return;
-
-        _speechStarted = true;
-        _events.CancelEvent(EVENT_RALIA_WALK_GUARD);
-
-        // the guard path may not actually be standing on the mark
-        if (!me->IsWithinDist3d(RALIA_SPEECH_X, RALIA_SPEECH_Y, RALIA_SPEECH_Z, 1.0f))
-            me->NearTeleportTo(RALIA_SPEECH_X, RALIA_SPEECH_Y, RALIA_SPEECH_Z, RALIA_SPEECH_O);
-
-        me->StopMoving();
-        me->SetFacingTo(RALIA_SPEECH_O);
-
-        sCreatureTextMgr->SendChat(me, TEXT_RALIA_SAVED, nullptr, CHAT_MSG_MONSTER_SAY, LANG_UNIVERSAL);
-
-        // RALIA_SPEECH_LINE matches creature_text group 1's Duration
-        _events.ScheduleEvent(EVENT_RALIA_SHIFT, RALIA_SPEECH_LINE);
+        // She hangs five yards off the altar, so a plain MoveFall() drops her
+        // beside it. Slide her over Hrun's spot at the current height first,
+        // then fall - the drop keeps its own motion and still lands on him.
+        me->NearTeleportTo(RALIA_DROP_X, RALIA_DROP_Y, me->GetPositionZ(), me->GetOrientation());
+        me->GetMotionMaster()->MoveFall();
     }
 
     void CheckForHelpCry()
@@ -7713,11 +8214,18 @@ private:
 
     void TransformIntoStag()
     {
+        // the stag is the only rideable form, so the click-to-ride interaction
+        // is handed back here and nowhere else
+        me->SetNpcFlag(RALIA_RIDE_NPC_FLAGS);
+
         if (me->GetDisplayId() == DISPLAY_RALIA_STAG)
             return;
 
-        // scale first so SetDisplayId recomputes the collision volume with it
-        me->SetObjectScale(RALIA_STAG_SCALE);
+        // 73350 is the display her own spawn row carries: radius 1.156, reach
+        // 0.70, and on this client it renders as the white stag. 127129, used
+        // here before, is radius 5.36 / reach 8.0 - a giant - which is why the
+        // transformed model looked wrong. No down-scaling needed any more.
+        me->SetObjectScale(1.0f);
         me->SetDisplayId(DISPLAY_RALIA_STAG);
     }
 
@@ -7728,16 +8236,71 @@ private:
         // gossip fallback: make sure the hover flag is gone before she runs
         ReleaseFromCaptiveState();
         TransformIntoStag();
+        _finishRequested = false;
         _events.CancelEvent(EVENT_RALIA_BOARD);
         _events.CancelEvent(EVENT_RALIA_SHIFT);
         sCreatureTextMgr->SendChat(me, TEXT_RALIA_SHIELD, nullptr, CHAT_MSG_MONSTER_SAY, LANG_UNIVERSAL);
 
+        // The escape is a scripted ride, not a fight. Mobs left alive in the
+        // burrow must not drag either of them into combat while it plays out:
+        // she is made immune to NPCs and her own fight is dropped, and the
+        // rider gets the same immunity. The rider's half matters because a
+        // passenger is still a valid attack target - damage aimed at them is
+        // redirected onto the vehicle, so without it every swing would put the
+        // player straight back into combat even though she takes no damage.
+        me->SetReactState(REACT_PASSIVE);
+        me->AttackStop();
+        me->SetImmuneToNPC(true);
+
+        if (Vehicle* kit = me->GetVehicleKit())
+        {
+            if (Unit* rider = kit->GetPassenger(0))
+            {
+                if (rider->IsPlayer())
+                {
+                    rider->ToPlayer()->SetImmuneToNPC(true);
+                    rider->ToPlayer()->CombatStopWithPets(true);
+                }
+            }
+        }
+
         me->SetWalk(false);
         me->GetMotionMaster()->Clear();
+
+        // Diagnostics for the last leg: a waypoint path that was not reloaded
+        // (fewer nodes than expected) and a spline the unit refuses to advance
+        // along both look identical in game - she simply stops. Log what the
+        // path actually holds so the two can be told apart from the log alone.
+        if (WaypointPath const* escapePath = sWaypointMgr->GetPath(RALIA_ESCAPE_PATH))
+        {
+            WaypointNode const& last = escapePath->Nodes.back();
+            TC_LOG_INFO("server", "Ralia (156929): path {} has {} node(s), last one at node {} ({:.2f}, {:.2f}, {:.2f}).",
+                uint32(RALIA_ESCAPE_PATH), uint32(escapePath->Nodes.size()), last.Id, last.X, last.Y, last.Z);
+        }
+        else
+            TC_LOG_ERROR("server", "Ralia (156929): waypoint path {} is NOT loaded on this server.", uint32(RALIA_ESCAPE_PATH));
+
         me->GetMotionMaster()->MovePath(RALIA_ESCAPE_PATH, false, {}, RALIA_RIDE_SPEED);
 
+        // arm the watchdog three seconds in, so the stationary ticks before the
+        // spline launches are not mistaken for a stall
+        _rideArmed = false;
+        _stuckMs = 0;
+        _heartbeatMs = 0;
+        _lastRideX = me->GetPositionX();
+        _lastRideY = me->GetPositionY();
+        _lastRideZ = me->GetPositionZ();
+        _events.ScheduleEvent(EVENT_RALIA_ARM_RIDE, 3s);
+
+        // AI-independent watchdog. Everything else in this file depends on this
+        // AI being ticked; this does not, and the ride must end even if the AI
+        // is gone by the time she reaches the last wall.
+        StartRaliaRideWatchdog(me);
+
         _events.ScheduleEvent(EVENT_RALIA_FIRE, 1200ms);
-        _events.ScheduleEvent(EVENT_RALIA_SHAKE, 1200ms);
+        // No EVENT_RALIA_SHAKE: the camera-shake spell is what puts the
+        // client into cinematic mode, i.e. the letterbox bars. See the note
+        // in HandleEvents() where the case used to be.
         _events.ScheduleEvent(EVENT_RALIA_LINE_SPIDERS, 8s);
         _events.ScheduleEvent(EVENT_RALIA_LINE_CREATURES, 22s);
         _events.ScheduleEvent(EVENT_RALIA_TIMEOUT, 180s);
@@ -7760,9 +8323,31 @@ private:
         passenger->ToPlayer()->CastSpell(passenger, SPELL_CAMERA_SHAKE, true);
     }
 
+    // Single place that decides who the rider is. The seat map is tried first,
+    // but Vehicle::GetPassenger(0) has come back empty on a live ride - the
+    // player is still on her back, she keeps running, yet the lookup finds
+    // nothing. The guid captured when the scene started is the real fallback:
+    // it is the player who triggered ACTION_HRUN_DIED and cannot drift.
+    Player* ResolveRider()
+    {
+        if (Vehicle* kit = me->GetVehicleKit())
+            for (int8 seat = 0; seat < 8; ++seat)
+                if (Unit* passenger = kit->GetPassenger(seat))
+                    if (passenger->IsPlayer())
+                        return passenger->ToPlayer();
+
+        if (Player* player = ObjectAccessor::GetPlayer(*me, _escapeeGUID))
+            return player;
+
+        return me->SelectNearestPlayer(50.0f);
+    }
+
     // Step 4: the ride ends at the mouth of the burrow. The player is put down
     // automatically, she shifts back to her night elf form, and only now does
     // the "Ride Ralia Dreamchaser to escape" objective get credited.
+    //
+    // The scene itself is handled by EndRaliaEscapeRide(), which needs no AI
+    // state: see its comment for why.
     void FinishEscape(Unit* passenger)
     {
         if (!_escaping)
@@ -7770,47 +8355,38 @@ private:
 
         Player* player = (passenger && passenger->IsPlayer()) ? passenger->ToPlayer() : nullptr;
 
-        TC_LOG_INFO("server", "Ralia (156929): escape finished at ({:.2f}, {:.2f}, {:.2f}), rider {}.",
-            me->GetPositionX(), me->GetPositionY(), me->GetPositionZ(),
-            player ? player->GetName() : "<none>");
+        // resolve before the guid is cleared below - once the seat map comes
+        // back empty it is the only handle left on the rider
+        if (!player)
+            player = ResolveRider();
 
         _events.Reset();
         _escaping = false;
         _escapeeGUID.Clear();
+        _rideArmed = false;
+        _stuckMs = 0;
 
-        me->GetMotionMaster()->Clear();
-        me->StopMoving();
+        EndRaliaEscapeRide(me, player);
+    }
 
-        if (passenger)
-            passenger->ExitVehicle();
+public:
+    // Called by RaliaRideWatchdog when the ride has stopped making progress.
+    // Its job is only to drop the AI-side state (so the flavour events stop
+    // firing and a later timeout cannot credit the ride twice) and hand over to
+    // EndRaliaEscapeRide().
+    void ForceCloseRide()
+    {
+        // resolve first: the teardown below clears the guid
+        Player* rider = ResolveRider();
 
-        // A vehicle keeps its base model while a passenger is still on it, so
-        // the shift back has to happen strictly after ExitVehicle(); doing it
-        // before left the stag standing on the ledge as a stag.
-        me->SetObjectScale(1.0f);
-        me->SetDisplayId(NightElfDisplay());
-        me->SetHover(false);
-        me->SetHoverHeight(0.0f);
+        _events.Reset();
+        _escaping = false;
+        _finishRequested = false;
+        _escapeeGUID.Clear();
+        _rideArmed = false;
+        _stuckMs = 0;
 
-        if (player)
-        {
-            // Put her down with the player instead of leaving her wherever the
-            // last waypoint happened to be, so the two of them end the scene
-            // standing together on the ledge the quest sends them back to.
-            float x = player->GetPositionX() + std::cos(player->GetOrientation()) * 1.8f;
-            float y = player->GetPositionY() + std::sin(player->GetOrientation()) * 1.8f;
-            me->NearTeleportTo(x, y, player->GetPositionZ(), me->GetOrientation());
-            me->SetFacingToObject(player);
-
-            // objective 393740 "Ride Ralia Dreamchaser to escape"
-            player->KilledMonsterCredit(NPC_RALIA_DREAMCHASER_Q55639);
-        }
-
-        sCreatureTextMgr->SendChat(me, TEXT_RALIA_OUT, passenger, CHAT_MSG_MONSTER_SAY, LANG_UNIVERSAL);
-
-        // Long enough for the player to actually see her back in night elf
-        // form; the respawn delay still governs when she returns to the pit.
-        me->DespawnOrUnsummon(2min, Seconds(me->GetRespawnDelay()));
+        EndRaliaEscapeRide(me, rider);
     }
 
     EventMap _events;
@@ -7818,8 +8394,96 @@ private:
     ObjectGuid _ejectGUID;
     bool _escaping = false;
     bool _saidHelp = false;
-    bool _speechStarted = false;
+    bool _finishRequested = false;
+
+    // Ride watchdog. The last leg has failed in every way a movement can fail:
+    // a vertical-only spline that does not advance, a spline that ends three
+    // yards short of the node, and a waypoint callback that never arrives. None
+    // of those may leave the player sitting on her back with the quest open, so
+    // the ride is finished from UpdateAI alone once she stops making progress.
+    bool _rideArmed = false;
+    uint32 _stuckMs = 0;
+    uint32 _heartbeatMs = 0;
+    uint32 _tickProbeMs = 0;
+    float _lastRideX = 0.0f;
+    float _lastRideY = 0.0f;
+    float _lastRideZ = 0.0f;
 };
+
+// Ticks off Object::m_Events, i.e. it does not need the AI to be alive. Watches
+// her position while somebody is riding and closes the ride once she has not
+// moved for five seconds, which no healthy ride does. This is the only part of
+// the escape that has never failed to run.
+class RaliaRideWatchdog : public BasicEvent
+{
+public:
+    explicit RaliaRideWatchdog(Creature* ralia) : _ralia(ralia) { }
+
+    bool Execute(uint64 /*time*/, uint32 diff) override
+    {
+        if (!_ralia || !_ralia->IsInWorld())
+            return true;
+
+        Vehicle* kit = _ralia->GetVehicleKit();
+        Unit* passenger = kit ? kit->GetPassenger(0) : nullptr;
+        if (!passenger || !passenger->IsPlayer())
+            return true;    // nobody riding any more, stop watching
+
+        float x = _ralia->GetPositionX();
+        float y = _ralia->GetPositionY();
+        float z = _ralia->GetPositionZ();
+
+        if (!_hasLast)
+        {
+            _hasLast = true;
+            _lastX = x;
+            _lastY = y;
+            _lastZ = z;
+        }
+        else if (_ralia->GetDistance(_lastX, _lastY, _lastZ) > 2.0f)
+        {
+            _lastX = x;
+            _lastY = y;
+            _lastZ = z;
+            _stallMs = 0;
+        }
+        else
+            _stallMs += diff;
+
+        _elapsedMs += diff;
+
+        if (_stallMs < 5000 && _elapsedMs < 150000)
+            return false;   // still riding, keep watching
+
+        TC_LOG_ERROR("server", "Ralia (156929): ride watchdog closing the scene at ({:.2f}, {:.2f}, {:.2f}) after {} ms.",
+            x, y, z, _elapsedMs);
+
+        if (npc_ralia_dreamchaser_q55639* ai = dynamic_cast<npc_ralia_dreamchaser_q55639*>(_ralia->AI()))
+        {
+            ai->ForceCloseRide();
+            return true;
+        }
+
+        // the AI is gone entirely (which is what the ride keeps running into):
+        // close the scene with nothing but the creature and the rider
+        EndRaliaEscapeRide(_ralia, passenger->ToPlayer());
+        return true;
+    }
+
+private:
+    Creature* _ralia;
+    float _lastX = 0.0f;
+    float _lastY = 0.0f;
+    float _lastZ = 0.0f;
+    bool _hasLast = false;
+    uint32 _stallMs = 0;
+    uint32 _elapsedMs = 0;
+};
+
+void StartRaliaRideWatchdog(Creature* ralia)
+{
+    ralia->m_Events.AddEventAtOffset(new RaliaRideWatchdog(ralia), 1500ms);
+}
 
 // 156900 - Hrun the Exiled
 //
@@ -7928,6 +8592,177 @@ private:
     EventMap _events;
     ObjectGuid _raliaGUID;
     bool _saidLowHealth = false;
+};
+
+// ---------------------------------------------------------------------------
+// TEMPORARY diagnostic - remove once Garrick (156651) is settled.
+//
+// The NPC undeniably exists server side: FindNearestCreature returns it, the
+// summon path logs a creature right under the player, phasing reports the same
+// shift - and the client still draws nothing. HaveAtClient() is the server side
+// mirror of the client's visible-object set, so it splits "the server never
+// pushed it" from "it was pushed and the client refused to render it", which
+// are completely different bugs. Every line is logged only when the answer
+// changes, so this cannot flood the log.
+// ---------------------------------------------------------------------------
+class ExilesReachGarrickProbe : public WorldScript
+{
+public:
+    ExilesReachGarrickProbe() : WorldScript("ExilesReachGarrickProbe") { }
+
+    void OnUpdate(uint32 diff) override
+    {
+        _timer += diff;
+
+        if (_timer < 5000)
+            return;
+
+        _timer = 0;
+
+        Map* map = sMapMgr->FindMap(2175, 0);
+
+        if (!map)
+            return;
+
+        map->DoOnPlayers([this](Player* player)
+        {
+            if (!player->IsInWorld())
+                return;
+
+            Creature* garrick = player->FindNearestCreature(NPC_CAPTAIN_GARRICK_Q55639, 60.0f);
+
+            if (!garrick)
+            {
+                if (_missingReported)
+                    return;
+
+                _missingReported = true;
+                _haveLast = false;
+
+                TC_LOG_INFO("server", "Garrick probe: no creature {} within 60 yd of {}.", NPC_CAPTAIN_GARRICK_Q55639, player->GetName());
+                return;
+            }
+
+            _missingReported = false;
+
+            bool atClient = player->HaveAtClient(garrick);
+
+            if (_haveLast && _lastGuid == garrick->GetGUID() && _lastAtClient == atClient)
+                return;
+
+            _haveLast = true;
+            _lastGuid = garrick->GetGUID();
+            _lastAtClient = atClient;
+
+            TC_LOG_INFO("server", "Garrick probe: {} display {} in world {} dist {:.1f} | can see {} | at client {} | phases player {} / npc {} | same phase {}.",
+                garrick->GetGUID().ToString(), garrick->GetDisplayId(),
+                garrick->IsInWorld() ? 1 : 0, player->GetDistance(garrick),
+                player->CanSeeOrDetect(garrick) ? 1 : 0, atClient ? 1 : 0,
+                player->GetPhaseShift().GetPhases().size(),
+                garrick->GetPhaseShift().GetPhases().size(),
+                garrick->InSamePhase(player) ? 1 : 0);
+
+            // Which single check inside CanSeeOrDetect() is rejecting it.
+            TC_LOG_INFO("server", "Garrick probe detail: private {} ownerVis {} conditions {} spawnTracking {} alive {} timeSync {}.",
+                garrick->IsPrivateObject() ? 1 : 0,
+                garrick->CheckPrivateObjectOwnerVisibility(player) ? 1 : 0,
+                sConditionMgr->IsObjectMeetingVisibilityByObjectIdConditions(garrick, player) ? 1 : 0,
+                garrick->GetSpawnTrackingStateDataForPlayer(player) ? 1 : 0,
+                garrick->IsAlive() ? 1 : 0,
+                player->HasPlayerLocalFlag(PLAYER_LOCAL_FLAG_OVERRIDE_TRANSPORT_SERVER_TIME) ? 1 : 0);
+        });
+    }
+
+private:
+    uint32 _timer = 0;
+    bool _missingReported = false;
+    bool _haveLast = false;
+    bool _lastAtClient = false;
+    ObjectGuid _lastGuid;
+};
+
+// ***************************************************************
+// * A Druid's Form (59350 / 59951)                              *
+// ***************************************************************
+//
+// The quest asks the player to "Commune with the Druid Stone" and its only
+// objective is monster 174832 - a scene kill credit, not a real spawn. The
+// world DB has no spawn row for the stone (gameobject 346113 exists in
+// gameobject_template, but nothing places it anywhere), there is no
+// areatrigger and no scene_template record on map 2175, and nothing in this
+// file ever touches 174832. In game that reads exactly like the quest arrow
+// does: a patch of empty ground where standing does nothing.
+//
+// The stone itself is a client-side prop, so there is nothing to click server
+// side. The objective is therefore handed out by proximity. These three spots
+// are the quest's own POI points (quest_poi_points for 59350/59951).
+namespace
+{
+    constexpr uint32 QUEST_A_DRUIDS_FORM_ALLIANCE   = 59350;
+    constexpr uint32 QUEST_A_DRUIDS_FORM_HORDE      = 59951;
+    constexpr uint32 OBJECTIVE_COMMUNE_DRUID_STONE  = 396388;
+    constexpr uint32 NPC_DRUID_STONE_CREDIT         = 174832;
+    constexpr float  DRUID_STONE_RANGE              = 14.0f;
+
+    Position const DruidStoneSpots[] =
+    {
+        { 321.0f, -2057.0f, 112.0f, 0.0f },
+        { 323.0f, -2052.0f, 113.0f, 0.0f },
+        { 182.0f, -2288.0f,  82.0f, 0.0f },
+    };
+}
+
+class ExilesReachDruidStone : public WorldScript
+{
+public:
+    ExilesReachDruidStone() : WorldScript("ExilesReachDruidStone") { }
+
+    void OnUpdate(uint32 diff) override
+    {
+        _timer += diff;
+
+        if (_timer < 1000)
+            return;
+
+        _timer = 0;
+
+        Map* map = sMapMgr->FindMap(2175, 0);
+
+        if (!map)
+            return;
+
+        map->DoOnPlayers([](Player* player)
+        {
+            if (!player->IsInWorld())
+                return;
+
+            uint32 quest = player->GetQuestStatus(QUEST_A_DRUIDS_FORM_ALLIANCE) == QUEST_STATUS_INCOMPLETE
+                ? QUEST_A_DRUIDS_FORM_ALLIANCE
+                : QUEST_A_DRUIDS_FORM_HORDE;
+
+            if (player->GetQuestStatus(quest) != QUEST_STATUS_INCOMPLETE)
+                return;
+
+            if (player->GetQuestObjectiveData(quest, OBJECTIVE_COMMUNE_DRUID_STONE) > 0)
+                return;
+
+            for (Position const& spot : DruidStoneSpots)
+            {
+                if (player->GetDistance(spot.GetPositionX(), spot.GetPositionY(), spot.GetPositionZ()) > DRUID_STONE_RANGE)
+                    continue;
+
+                player->KilledMonsterCredit(NPC_DRUID_STONE_CREDIT);
+
+                TC_LOG_INFO("server", "Druid Stone: {} communed at ({:.1f}, {:.1f}, {:.1f}) for quest {}.",
+                    player->GetName(), player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), quest);
+
+                break;
+            }
+        });
+    }
+
+private:
+    uint32 _timer = 0;
 };
 
 void AddSC_zone_exiles_reach()
@@ -8061,4 +8896,9 @@ void AddSC_zone_exiles_reach()
     // Who Lurks in the Pit
     RegisterCreatureAI(npc_ralia_dreamchaser_q55639);
     RegisterCreatureAI(npc_hrun_the_exiled_q55639);
+    // TEMPORARY Garrick visibility diagnostic
+    new ExilesReachGarrickProbe();
+    // A Druid's Form - the stone has no spawn row, so the objective is
+    // credited by proximity (see the class comment).
+    new ExilesReachDruidStone();
 }
